@@ -1,0 +1,763 @@
+from __future__ import annotations
+
+from datetime import datetime
+from enum import Enum
+from typing import Optional
+
+from pydantic import BaseModel, Field, HttpUrl
+
+
+# ============================================================
+# ENUMS
+# ============================================================
+
+class AcademicSource(str, Enum):
+    ARXIV = "arxiv"
+    SEMANTIC_SCHOLAR = "semantic_scholar"
+    OPENALEX = "openalex"
+    CROSSREF = "crossref"
+    TAVILY = "tavily"
+
+
+class RetrievalStatus(str, Enum):
+    PENDING = "pending"
+    DOWNLOADED = "downloaded"
+    FAILED = "failed"
+
+
+class ReviewStatus(str, Enum):
+    PASS = "PASS"
+    REVISE = "REVISE"
+
+
+class Severity(str, Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+class ConfidenceLevel(str, Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+class EvidenceType(str, Enum):
+    METHODOLOGY = "methodology"
+    RESULT = "result"
+    FINDING = "finding"
+    LIMITATION = "limitation"
+    DATASET = "dataset"
+    COMPARISON = "comparison"
+    FIGURE = "figure"
+    TABLE = "table"
+    EQUATION = "equation"
+    OTHER = "other"
+
+
+# ============================================================
+# ROOT AGENT OUTPUT
+# ============================================================
+
+class ResearchSpecification(BaseModel):
+    """
+    Structured research requirements produced by the Root Agent
+    after interviewing the user and planning the research.
+    """
+
+    research_question: str = Field(
+        ...,
+        min_length=5,
+        description="Primary research question supplied/refined by the user."
+    )
+
+    objective: str = Field(
+        ...,
+        description="Main objective of the literature review."
+    )
+
+    scope: Optional[str] = Field(
+        default=None,
+        description="Defined scope and boundaries of the research."
+    )
+
+    key_questions: list[str] = Field(
+        default_factory=list,
+        description="Sub-questions that should be answered."
+    )
+
+    time_range_start: Optional[int] = None
+    time_range_end: Optional[int] = None
+
+    domains: list[str] = Field(default_factory=list)
+
+    preferred_sources: list[AcademicSource] = Field(
+        default_factory=list
+    )
+
+    inclusion_criteria: list[str] = Field(
+        default_factory=list
+    )
+
+    exclusion_criteria: list[str] = Field(
+        default_factory=list
+    )
+
+    required_languages: list[str] = Field(
+        default_factory=lambda: ["English"]
+    )
+
+    expected_paper_count: int = Field(
+        default=20,
+        ge=1,
+        le=200
+    )
+
+    search_dimensions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Important dimensions such as methods, datasets, "
+            "benchmarks, applications, limitations, etc."
+        )
+    )
+
+    keywords: list[str] = Field(default_factory=list)
+
+    synonyms: list[str] = Field(default_factory=list)
+
+    related_concepts: list[str] = Field(default_factory=list)
+
+
+# ============================================================
+# SEARCH COORDINATOR
+# ============================================================
+
+class SearchQuery(BaseModel):
+    """
+    Search query generated/executed by the Search Coordinator.
+    """
+
+    query_id: str
+
+    query: str = Field(
+        ...,
+        min_length=2
+    )
+
+    purpose: str
+
+    source: AcademicSource
+
+    priority: int = Field(
+        default=1,
+        ge=1,
+        le=5
+    )
+
+
+class WebSource(BaseModel):
+    """
+    General web context returned by Tavily.
+    """
+
+    source_id: str
+
+    title: str
+
+    url: str
+
+    content: Optional[str] = None
+
+    query_id: Optional[str] = None
+
+
+# ============================================================
+# PAPER METADATA
+# ============================================================
+
+class PaperMetadata(BaseModel):
+    """
+    Canonical paper representation used throughout the system.
+
+    All academic APIs must be normalized into this schema.
+    """
+
+    paper_id: str
+
+    title: str
+
+    authors: list[str] = Field(
+        default_factory=list
+    )
+
+    abstract: Optional[str] = None
+
+    publication_year: Optional[int] = None
+
+    publication_date: Optional[str] = None
+
+    doi: Optional[str] = None
+
+    arxiv_id: Optional[str] = None
+
+    venue: Optional[str] = None
+
+    source: AcademicSource
+
+    source_id: Optional[str] = None
+
+    landing_url: Optional[str] = None
+
+    pdf_url: Optional[str] = None
+
+    citation_count: Optional[int] = None
+
+    keywords: list[str] = Field(
+        default_factory=list
+    )
+
+
+class RetrievedPaper(BaseModel):
+    """
+    Candidate paper retrieved by Search Coordinator.
+
+    Deduplication and re-ranking happen AFTER this,
+    inside the Analysis Agent.
+    """
+
+    metadata: PaperMetadata
+
+    pdf_path: Optional[str] = None
+
+    retrieval_status: RetrievalStatus = RetrievalStatus.PENDING
+
+    retrieval_error: Optional[str] = None
+
+
+# ============================================================
+# ANALYSIS AGENT
+# ============================================================
+
+class PageAnalysis(BaseModel):
+    """
+    VLM interpretation of one complete rendered PDF page.
+
+    No separate text/table/image extraction pipeline is assumed.
+    """
+
+    paper_id: str
+
+    page_number: int = Field(
+        ...,
+        ge=1
+    )
+
+    image_path: str
+
+    summary: str
+
+    relevant_content: list[str] = Field(
+        default_factory=list
+    )
+
+    methods: list[str] = Field(
+        default_factory=list
+    )
+
+    datasets: list[str] = Field(
+        default_factory=list
+    )
+
+    findings: list[str] = Field(
+        default_factory=list
+    )
+
+    tables_observed: list[str] = Field(
+        default_factory=list
+    )
+
+    figures_observed: list[str] = Field(
+        default_factory=list
+    )
+
+    equations_observed: list[str] = Field(
+        default_factory=list
+    )
+
+    limitations: list[str] = Field(
+        default_factory=list
+    )
+
+
+class Evidence(BaseModel):
+    """
+    Atomic source-grounded evidence.
+
+    Every important synthesized claim should ultimately be
+    traceable to one or more Evidence objects.
+    """
+
+    evidence_id: str
+
+    paper_id: str
+
+    page_numbers: list[int] = Field(
+        default_factory=list
+    )
+
+    description: str
+
+    evidence_type: EvidenceType
+
+    relevance_to_research_question: str
+
+    supporting_observation: Optional[str] = None
+
+    confidence: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0
+    )
+
+
+class PaperAnalysis(BaseModel):
+    """
+    Structured understanding of a selected paper.
+    """
+
+    paper_id: str
+
+    research_objective: Optional[str] = None
+
+    methodology: Optional[str] = None
+
+    datasets: list[str] = Field(
+        default_factory=list
+    )
+
+    experimental_setup: Optional[str] = None
+
+    metrics: dict[str, str] = Field(
+        default_factory=dict
+    )
+
+    key_findings: list[str] = Field(
+        default_factory=list
+    )
+
+    contributions: list[str] = Field(
+        default_factory=list
+    )
+
+    limitations: list[str] = Field(
+        default_factory=list
+    )
+
+    future_work: list[str] = Field(
+        default_factory=list
+    )
+
+    page_analyses: list[PageAnalysis] = Field(
+        default_factory=list
+    )
+
+    evidence: list[Evidence] = Field(
+        default_factory=list
+    )
+
+
+class RankedPaper(BaseModel):
+    """
+    Analysis Agent output after deduplication and re-ranking.
+    """
+
+    paper_id: str
+
+    rank: int = Field(
+        ...,
+        ge=1
+    )
+
+    relevance_score: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0
+    )
+
+    ranking_reason: Optional[str] = None
+
+
+# ============================================================
+# SYNTHESIZER
+# ============================================================
+
+class ResearchGap(BaseModel):
+    """
+    Evidence-backed gap identified across the literature.
+    """
+
+    gap_id: str
+
+    description: str
+
+    supporting_papers: list[str] = Field(
+        default_factory=list
+    )
+
+    supporting_evidence_ids: list[str] = Field(
+        default_factory=list
+    )
+
+    existing_attempts: list[str] = Field(
+        default_factory=list
+    )
+
+    why_gap_exists: Optional[str] = None
+
+    importance: Optional[str] = None
+
+    potential_research_direction: Optional[str] = None
+
+    confidence: ConfidenceLevel = ConfidenceLevel.MEDIUM
+
+
+class Claim(BaseModel):
+    """
+    Research claim used by synthesis/writer.
+
+    A claim should be linked to evidence and citations.
+    """
+
+    claim_id: str
+
+    text: str
+
+    evidence_ids: list[str] = Field(
+        default_factory=list
+    )
+
+    citation_ids: list[str] = Field(
+        default_factory=list
+    )
+
+
+class Synthesis(BaseModel):
+    """
+    Cross-paper synthesis produced by Synthesizer.
+    """
+
+    thematic_findings: list[str] = Field(
+        default_factory=list
+    )
+
+    methodological_comparison: list[str] = Field(
+        default_factory=list
+    )
+
+    dataset_comparison: list[str] = Field(
+        default_factory=list
+    )
+
+    metric_comparison: list[str] = Field(
+        default_factory=list
+    )
+
+    contradictions: list[str] = Field(
+        default_factory=list
+    )
+
+    common_trends: list[str] = Field(
+        default_factory=list
+    )
+
+    strengths: list[str] = Field(
+        default_factory=list
+    )
+
+    weaknesses: list[str] = Field(
+        default_factory=list
+    )
+
+    research_gaps: list[ResearchGap] = Field(
+        default_factory=list
+    )
+
+    claims: list[Claim] = Field(
+        default_factory=list
+    )
+
+
+# ============================================================
+# WRITER
+# ============================================================
+
+class Citation(BaseModel):
+    """
+    Controlled citation.
+
+    Writer should create/select citations using retrieved
+    PaperMetadata rather than inventing bibliographic data.
+    """
+
+    citation_id: str
+
+    paper_id: str
+
+    title: str
+
+    authors: list[str] = Field(
+        default_factory=list
+    )
+
+    year: Optional[int] = None
+
+    doi: Optional[str] = None
+
+    source_url: Optional[str] = None
+
+
+class ReviewSection(BaseModel):
+    """
+    One section of the generated literature review.
+    """
+
+    section_id: str
+
+    heading: str
+
+    content: str
+
+    claim_ids: list[str] = Field(
+        default_factory=list
+    )
+
+
+class LiteratureReviewDraft(BaseModel):
+    """
+    Structured draft generated by Writer.
+    """
+
+    title: str
+
+    introduction: str
+
+    sections: list[ReviewSection] = Field(
+        default_factory=list
+    )
+
+    conclusion: str
+
+    claims: list[Claim] = Field(
+        default_factory=list
+    )
+
+    citations: list[Citation] = Field(
+        default_factory=list
+    )
+
+
+# ============================================================
+# CONTENT REVIEWER
+# ============================================================
+
+class ReviewIssue(BaseModel):
+    issue_id: str
+
+    description: str
+
+    severity: Severity
+
+    claim_id: Optional[str] = None
+
+    section_id: Optional[str] = None
+
+    required_action: str
+
+
+class ContentReviewResult(BaseModel):
+    """
+    Output of Content Reviewer.
+    """
+
+    status: ReviewStatus
+
+    issues: list[ReviewIssue] = Field(
+        default_factory=list
+    )
+
+    unsupported_claim_ids: list[str] = Field(
+        default_factory=list
+    )
+
+    missing_coverage: list[str] = Field(
+        default_factory=list
+    )
+
+    revision_instructions: list[str] = Field(
+        default_factory=list
+    )
+
+    summary: Optional[str] = None
+
+
+# ============================================================
+# CITATION REVIEWER
+# ============================================================
+
+class CitationVerification(BaseModel):
+    """
+    Verification result for a single citation.
+    """
+
+    citation_id: str
+
+    paper_id: str
+
+    paper_exists: bool = False
+
+    doi_verified: bool = False
+
+    metadata_verified: bool = False
+
+    source_verified: bool = False
+
+    claim_supported: bool = False
+
+    verified_title: Optional[str] = None
+
+    verified_doi: Optional[str] = None
+
+    verification_sources: list[str] = Field(
+        default_factory=list
+    )
+
+    supported_claim_ids: list[str] = Field(
+        default_factory=list
+    )
+
+    unsupported_claim_ids: list[str] = Field(
+        default_factory=list
+    )
+
+    explanation: Optional[str] = None
+
+    issues: list[str] = Field(
+        default_factory=list
+    )
+
+
+class CitationReviewResult(BaseModel):
+    """
+    Output of Citation Reviewer.
+    """
+
+    status: ReviewStatus
+
+    verifications: list[CitationVerification] = Field(
+        default_factory=list
+    )
+
+    invalid_citation_ids: list[str] = Field(
+        default_factory=list
+    )
+
+    unsupported_claim_ids: list[str] = Field(
+        default_factory=list
+    )
+
+    revision_instructions: list[str] = Field(
+        default_factory=list
+    )
+
+    summary: Optional[str] = None
+
+
+# ============================================================
+# FINAL REPORT
+# ============================================================
+
+class FinalReport(BaseModel):
+    title: str
+
+    content: str
+
+    citations: list[Citation] = Field(
+        default_factory=list
+    )
+
+    verified: bool = False
+
+    content_review_passed: bool = False
+
+    citation_review_passed: bool = False
+
+    generated_at: datetime = Field(
+        default_factory=datetime.utcnow
+    )
+
+
+# ============================================================
+# SHARED RESEARCH STATE
+# ============================================================
+
+class ResearchState(BaseModel):
+    """
+    High-level runtime state.
+
+    Raw PDF/image bytes should NOT be stored here.
+    Store paths/IDs instead.
+    """
+
+    research_id: str
+
+    specification: Optional[ResearchSpecification] = None
+
+    search_queries: list[SearchQuery] = Field(
+        default_factory=list
+    )
+
+    web_sources: list[WebSource] = Field(
+        default_factory=list
+    )
+
+    retrieved_papers: list[RetrievedPaper] = Field(
+        default_factory=list
+    )
+
+    # Produced by Analysis Agent
+    ranked_papers: list[RankedPaper] = Field(
+        default_factory=list
+    )
+
+    selected_paper_ids: list[str] = Field(
+        default_factory=list
+    )
+
+    paper_analyses: list[PaperAnalysis] = Field(
+        default_factory=list
+    )
+
+    synthesis: Optional[Synthesis] = None
+
+    draft: Optional[LiteratureReviewDraft] = None
+
+    content_review: Optional[ContentReviewResult] = None
+
+    citation_review: Optional[CitationReviewResult] = None
+
+    final_report: Optional[FinalReport] = None
+
+    content_revision_round: int = Field(
+        default=0,
+        ge=0,
+        le=3
+    )
+
+    citation_revision_round: int = Field(
+        default=0,
+        ge=0,
+        le=3
+    )
+
+    current_stage: str = "initialized"

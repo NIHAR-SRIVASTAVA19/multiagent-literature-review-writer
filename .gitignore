@@ -1,0 +1,23 @@
+# Environment
+.env
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE
+.vscode/
+.idea/
+
+# Local persistent database
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
+# Temporary files
+*.tmp
+*.log

@@ -1,0 +1,5 @@
+pydantic
+google-adk
+dotenv
+litellm
+aiosqlite
