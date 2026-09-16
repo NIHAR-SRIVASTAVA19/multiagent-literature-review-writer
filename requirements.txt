@@ -3,3 +3,4 @@ google-adk
 dotenv
 litellm
 aiosqlite
+pymupdf

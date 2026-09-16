@@ -342,7 +342,11 @@ Available academic sources include:
 - OpenAlex
 - Crossref
 
-Use the appropriate search tool according to the requested source.
+Use the available retrieval execution tool to execute each query
+against the source specified by the Root Agent.
+
+Source routing is deterministic and must preserve the source
+specified in each SearchQuery.
 
 Retrieve real candidate research papers and their available metadata.
 
@@ -533,6 +537,52 @@ Paper Selection
 Vision-Grounded Paper Analysis
 """
 
+VLM_PAGE_ANALYSIS_PROMPT = """
+You are a vision-language research assistant. You are shown one or more
+complete rendered pages from an academic PDF, in the exact order given, as
+images. Each image is one full page - text, figures, tables, equations,
+captions, and layout all included.
+
+For EACH image, produce one JSON object describing that page. Return a
+single JSON array containing exactly one object per image, in the same
+order as the images were given. Do not merge pages together and do not
+skip any image.
+
+Each object must have exactly these fields:
+
+{
+  "summary": "one to three sentences describing what this page covers",
+  "relevant_content": ["notable content relevant to research analysis"],
+  "methods": ["methodology described on this page, if any"],
+  "datasets": ["datasets/benchmarks named on this page, if any"],
+  "findings": ["results or findings stated on this page, if any"],
+  "tables_observed": ["short description of each table on this page, if any"],
+  "figures_observed": ["short description of each figure/chart on this page, if any"],
+  "equations_observed": ["short description of each equation on this page, if any"],
+  "limitations": ["limitations mentioned on this page, if any"],
+  "metrics_observed": {"metric name": "reported value, as shown on the page"},
+  "future_work_mentions": ["future-work statements made on this page, if any"]
+}
+
+metrics_observed should capture concrete numeric results as they
+appear on the page (e.g. accuracy, F1, latency) - only report a
+metric if the page actually states a value; do not carry values over
+from other pages or estimate them.
+
+Rules:
+
+- Only report what is actually visible on the page. Never invent content.
+- If a page has no content for a list field (e.g. no tables), return an
+  empty list for that field - do not omit the field. Likewise return an
+  empty object {} for metrics_observed when the page states no metric
+  values.
+- If a page is a title page, reference list, or otherwise has little
+  analytical content, still return an object; summary should say so and
+  the list fields may be empty.
+- Return ONLY the JSON array. No markdown code fences, no commentary,
+  no text before or after the array.
+"""
+
 ANALYSIS_AGENT_PROMPT = """
 You are the Analysis Agent in a multi-agent automated literature review system.
 
@@ -669,9 +719,15 @@ Complete rendered pages are the primary input to the vision-language model.
 6. ANALYZE COMPLETE PAGES WITH VISION
 ============================================================
 
-Analyze the complete rendered pages using your vision capabilities.
+Use the vision-analysis tool to analyze the complete rendered pages.
 
-Interpret information appearing in:
+The tool itself performs the vision-language inference (the same model
+family you run on) directly against the full-resolution page images and
+returns structured PageAnalysis information for each page - you direct
+which paper and which rendered pages to send, and you interpret the
+structured results the tool returns.
+
+The tool interprets information appearing in:
 
 - body text,
 - headings,
@@ -682,11 +738,14 @@ Interpret information appearing in:
 - equations,
 - page layout.
 
-Analyze each relevant page in the context of the research question.
+Send each relevant page for analysis in the context of the research
+question.
 
-Do not assume that every page contains useful evidence.
+Do not assume that every page contains useful evidence - you do not have
+to send every rendered page (e.g. bibliography-only pages may be skipped).
 
-Produce structured PageAnalysis information where appropriate.
+Use the structured PageAnalysis information the tool returns as-is; do not
+override or fabricate findings it did not report.
 
 ============================================================
 7. BUILD PAPER-LEVEL ANALYSIS
@@ -706,7 +765,21 @@ Identify, when supported by the paper:
 - limitations,
 - future work.
 
-Do not invent information when the paper does not provide it.
+Do not invent information when the paper does not provide it. Leave a
+field empty/unset rather than guessing.
+
+Each page_analyses entry includes metrics_observed and
+future_work_mentions for that specific page. Use these as your primary
+source for the paper-level "evaluation metrics" and "future work"
+fields - merge/deduplicate the per-page values you were actually
+given rather than inferring them from prose elsewhere.
+
+Once you have worked out these fields from the page_analyses results,
+call the paper-analysis tool with the paper_id, the page_analyses list
+you were given, and your synthesized fields. The tool validates your
+synthesis against the required structure and re-attaches the
+page_analyses for you - it does not do the synthesis itself, and it
+does not add or generate evidence (evidence is a separate step).
 
 ============================================================
 8. GENERATE TRACEABLE EVIDENCE

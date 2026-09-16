@@ -6,8 +6,11 @@ from prompts import ANALYSIS_AGENT_PROMPT
 from tools import (
     deduplicate_papers,
     rerank_papers,
+    select_papers,
     download_pdf,
     render_pdf_pages,
+    analyze_pages_with_vlm,
+    build_paper_analysis,
 )
 
 load_dotenv()
@@ -29,7 +32,10 @@ analysis_agent = Agent(
     tools=[
         deduplicate_papers,
         rerank_papers,
+        select_papers,
         download_pdf,
         render_pdf_pages,
+        analyze_pages_with_vlm,
+        build_paper_analysis,
     ],
 )

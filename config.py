@@ -7,6 +7,96 @@ from google.adk.models.lite_llm import LiteLlm
 load_dotenv()
 
 # ============================================================
+# API URLS
+# ============================================================
+
+ARXIV_API_URL = os.getenv(
+    "ARXIV_API_URL",
+    "https://export.arxiv.org/api/query",
+)
+
+SEMANTIC_SCHOLAR_API_URL = os.getenv(
+    "SEMANTIC_SCHOLAR_API_URL",
+    "https://api.semanticscholar.org/graph/v1/paper/search",
+)
+
+OPENALEX_API_URL = os.getenv(
+    "OPENALEX_API_URL",
+    "https://api.openalex.org/works",
+)
+
+OPENALEX_MAILTO = os.getenv(
+    "OPENALEX_MAILTO"
+)
+
+CROSSREF_API_URL = os.getenv(
+    "CROSSREF_API_URL",
+    "https://api.crossref.org/works",
+)
+
+CROSSREF_MAILTO = os.getenv(
+    "CROSSREF_MAILTO"
+)
+
+TAVILY_API_URL = os.getenv(
+    "TAVILY_API_URL",
+    "https://api.tavily.com/search",
+)
+
+TAVILY_API_KEY = os.getenv(
+    "TAVILY_API_KEY"
+)
+
+# ============================================================
+# PAPER ARTIFACT STORAGE
+# ============================================================
+
+# Root directory under which each paper gets its own folder:
+#
+#   data/<paper_id>/<paper_id>.pdf
+#   data/<paper_id>/pages/page_0001.png
+#
+# Keeping a paper's PDF and its rendered pages together (instead of
+# separate data/pdfs/ and data/pages/ trees) keeps every artifact
+# for one paper in one place.
+PAPERS_DIR = os.getenv(
+    "PAPERS_DIR",
+    "data",
+)
+
+# 50 MB. Selected research-paper PDFs are almost always well under
+# this; it exists to stop a bad URL or paywall interstitial from
+# streaming an unbounded response to disk.
+MAX_PDF_DOWNLOAD_BYTES = int(
+    os.getenv(
+        "MAX_PDF_DOWNLOAD_BYTES",
+        str(50 * 1024 * 1024),
+    )
+)
+
+# Resolution used when rendering PDF pages to images for the VLM.
+# 150 DPI keeps normal text/figures/tables legible without producing
+# unreasonably large image files.
+PAGE_RENDER_DPI = int(
+    os.getenv(
+        "PAGE_RENDER_DPI",
+        "150",
+    )
+)
+
+# Number of rendered page images sent to the vision-language model in a
+# single call. Batching multiple pages per call (instead of one call per
+# page) reduces the number of VLM requests; the images stay at full
+# resolution (this does not composite pages into one image - see
+# analyze_pages_with_vlm() in tools.py).
+VLM_PAGES_PER_CALL = int(
+    os.getenv(
+        "VLM_PAGES_PER_CALL",
+        "4",
+    )
+)
+
+# ============================================================
 # DATABASE CONFIGURATION
 # ============================================================
 
@@ -72,12 +162,12 @@ SEARCH_MODEL = nvidia_model(
 )
 
 
-ANALYSIS_MODEL = nvidia_model(
-    os.getenv(
-        "ANALYSIS_MODEL",
-        "moonshotai/kimi-k3",
-    )
+ANALYSIS_MODEL_NAME = os.getenv(
+    "ANALYSIS_MODEL",
+    "moonshotai/kimi-k3",
 )
+
+ANALYSIS_MODEL = nvidia_model(ANALYSIS_MODEL_NAME)
 
 
 SYNTHESIZER_MODEL = nvidia_model(

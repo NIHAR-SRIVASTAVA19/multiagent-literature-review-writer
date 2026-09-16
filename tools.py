@@ -6,83 +6,2141 @@ These functions are currently placeholders.
 Actual API integrations and processing logic will be implemented
 after the agent architecture has been defined.
 """
+import base64
+import hashlib
+import json
+import os
+import re
+import xml.etree.ElementTree as ET
+import pymupdf
+import httpx
+import litellm
 
+from config import (
+    ARXIV_API_URL,
+    SEMANTIC_SCHOLAR_API_URL,
+    OPENALEX_API_URL,
+    OPENALEX_MAILTO,
+    CROSSREF_API_URL,
+    CROSSREF_MAILTO,
+    TAVILY_API_URL,
+    TAVILY_API_KEY,
+    PAPERS_DIR,
+    MAX_PDF_DOWNLOAD_BYTES,
+    PAGE_RENDER_DPI,
+    VLM_PAGES_PER_CALL,
+    ANALYSIS_MODEL_NAME,
+    NVIDIA_NIM_API_KEY,
+    NVIDIA_NIM_API_BASE,
+)
+
+from prompts import VLM_PAGE_ANALYSIS_PROMPT
+
+from schemas import (
+    AcademicSource,
+    PaperMetadata,
+    RankedPaper,
+    RetrievalStatus,
+    WebSource,
+    PageAnalysis,
+    PaperAnalysis,
+)
 
 # ============================================================
 # SEARCH COORDINATOR TOOLS
 # ============================================================
 
-def search_arxiv(query: str) -> dict:
-    """
-    Search arXiv for research papers matching the provided query.
-    """
-    pass
 
 
-def search_semantic_scholar(query: str) -> dict:
+
+async def search_arxiv(
+    query: str,
+    max_results: int = 10,
+) -> dict:
     """
-    Search Semantic Scholar for research papers matching the query.
+    Search arXiv for candidate research papers.
+
+    The function executes a provided search query only.
+    It does not generate queries, deduplicate results,
+    rank papers, or select papers.
+
+    Args:
+        query:
+            Search query provided by the Root Agent.
+
+        max_results:
+            Maximum number of papers to retrieve.
+
+    Returns:
+        JSON-compatible dictionary containing normalized
+        candidate paper metadata.
     """
-    pass
+
+    max_results = max(1, min(max_results, 50))
+
+    params = {
+        "search_query": f"all:{query}",
+        "start": 0,
+        "max_results": max_results,
+        "sortBy": "relevance",
+        "sortOrder": "descending",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                ARXIV_API_URL,
+                params=params,
+            )
+
+            if response.status_code == 429:
+                return {
+                    "success": False,
+                    "source": AcademicSource.ARXIV.value,
+                    "query": query,
+                    "count": 0,
+                    "papers": [],
+                    "error": "arXiv rate limit exceeded.",
+                }
+
+            if response.status_code == 503:
+                return {
+                    "success": False,
+                    "source": AcademicSource.ARXIV.value,
+                    "query": query,
+                    "count": 0,
+                    "papers": [],
+                    "error": "arXiv temporarily unavailable (503).",
+                }
+
+            response.raise_for_status()
+
+    except httpx.HTTPError as exc:
+        return {
+            "success": False,
+            "source": AcademicSource.ARXIV.value,
+            "query": query,
+            "count": 0,
+            "papers": [],
+            "error": str(exc) or f"{type(exc).__name__} with no message.",
+        }
+
+    try:
+        root = ET.fromstring(response.text)
+
+    except ET.ParseError as exc:
+        return {
+            "success": False,
+            "source": AcademicSource.ARXIV.value,
+            "query": query,
+            "count": 0,
+            "papers": [],
+            "error": f"Failed to parse arXiv response: {exc}",
+        }
+
+    namespaces = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "arxiv": "http://arxiv.org/schemas/atom",
+    }
+
+    papers = []
+
+    for entry in root.findall("atom:entry", namespaces):
+
+        # ----------------------------------------------------
+        # arXiv ID
+        # ----------------------------------------------------
+
+        entry_id = entry.findtext(
+            "atom:id",
+            default="",
+            namespaces=namespaces,
+        )
+
+        arxiv_id = (
+            entry_id.rstrip("/")
+            .split("/")[-1]
+            if entry_id
+            else None
+        )
+
+        # ----------------------------------------------------
+        # Title
+        # ----------------------------------------------------
+
+        title = entry.findtext(
+            "atom:title",
+            default="",
+            namespaces=namespaces,
+        )
+
+        title = " ".join(title.split())
+
+        # ----------------------------------------------------
+        # Abstract
+        # ----------------------------------------------------
+
+        abstract = entry.findtext(
+            "atom:summary",
+            default="",
+            namespaces=namespaces,
+        )
+
+        abstract = " ".join(abstract.split()) or None
+
+        # ----------------------------------------------------
+        # Authors
+        # ----------------------------------------------------
+
+        authors = []
+
+        for author in entry.findall(
+            "atom:author",
+            namespaces,
+        ):
+            name = author.findtext(
+                "atom:name",
+                default="",
+                namespaces=namespaces,
+            )
+
+            if name:
+                authors.append(name.strip())
+
+        # ----------------------------------------------------
+        # Publication date
+        # ----------------------------------------------------
+
+        published = entry.findtext(
+            "atom:published",
+            default="",
+            namespaces=namespaces,
+        )
+
+        publication_year = None
+
+        if published:
+            try:
+                publication_year = int(published[:4])
+            except ValueError:
+                pass
+
+        # ----------------------------------------------------
+        # DOI
+        # ----------------------------------------------------
+
+        doi = entry.findtext(
+            "arxiv:doi",
+            default=None,
+            namespaces=namespaces,
+        )
+
+        if doi:
+            doi = doi.strip()
+
+        # ----------------------------------------------------
+        # Venue
+        # ----------------------------------------------------
+
+        venue = entry.findtext(
+            "arxiv:journal_ref",
+            default=None,
+            namespaces=namespaces,
+        )
+
+        if venue:
+            venue = " ".join(venue.split())
+
+        # ----------------------------------------------------
+        # Categories / keywords
+        # ----------------------------------------------------
+
+        keywords = []
+
+        for category in entry.findall(
+            "atom:category",
+            namespaces,
+        ):
+            term = category.attrib.get("term")
+
+            if term:
+                keywords.append(term)
+
+        # ----------------------------------------------------
+        # URLs
+        # ----------------------------------------------------
+
+        landing_url = entry_id or None
+        pdf_url = None
+
+        for link in entry.findall(
+            "atom:link",
+            namespaces,
+        ):
+            if link.attrib.get("title") == "pdf":
+                pdf_url = link.attrib.get("href")
+                break
+
+        # ----------------------------------------------------
+        # Stable internal ID
+        # ----------------------------------------------------
+
+        identity = arxiv_id or doi or title
+
+        paper_id = "paper_" + hashlib.sha256(
+            identity.encode("utf-8")
+        ).hexdigest()[:16]
+
+        # ----------------------------------------------------
+        # Normalize into canonical schema
+        # ----------------------------------------------------
+
+        paper = PaperMetadata(
+            paper_id=paper_id,
+            title=title,
+            authors=authors,
+            abstract=abstract,
+            publication_year=publication_year,
+            publication_date=published or None,
+            doi=doi,
+            arxiv_id=arxiv_id,
+            venue=venue,
+            source=AcademicSource.ARXIV,
+            source_id=arxiv_id,
+            landing_url=landing_url,
+            pdf_url=pdf_url,
+            citation_count=None,
+            keywords=keywords,
+        )
+
+        papers.append(
+            paper.model_dump(mode="json")
+        )
+
+    return {
+        "success": True,
+        "source": AcademicSource.ARXIV.value,
+        "query": query,
+        "count": len(papers),
+        "papers": papers,
+        "error": None,
+    }
 
 
-def search_openalex(query: str) -> dict:
+async def search_semantic_scholar(
+    query: str,
+    max_results: int = 10,
+) -> dict:
     """
-    Search OpenAlex for research papers matching the query.
+    Search Semantic Scholar for candidate research papers.
+
+    This function only executes the provided search query.
+    It does not generate queries, deduplicate papers,
+    rank papers, or select papers.
+
+    Args:
+        query:
+            Search query provided by the Root Agent.
+
+        max_results:
+            Maximum number of results to retrieve.
+
+    Returns:
+        JSON-compatible dictionary containing normalized
+        PaperMetadata objects.
     """
-    pass
+
+    max_results = max(1, min(max_results, 100))
+
+    fields = ",".join([
+        "paperId",
+        "title",
+        "authors",
+        "abstract",
+        "year",
+        "publicationDate",
+        "venue",
+        "citationCount",
+        "externalIds",
+        "url",
+        "openAccessPdf",
+        "fieldsOfStudy",
+    ])
+
+    params = {
+        "query": query,
+        "limit": max_results,
+        "fields": fields,
+    }
 
 
-def search_crossref(query: str) -> dict:
-    """
-    Search Crossref for scholarly works matching the query.
-    """
-    pass
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                SEMANTIC_SCHOLAR_API_URL,
+                params=params,
+            )
+
+            if response.status_code == 429:
+                return {
+                    "success": False,
+                    "source": AcademicSource.SEMANTIC_SCHOLAR.value,
+                    "query": query,
+                    "count": 0,
+                    "papers": [],
+                    "error": "Semantic Scholar rate limit exceeded.",
+                }
+
+            response.raise_for_status()
+
+    except httpx.HTTPError as exc:
+        return {
+            "success": False,
+            "source": AcademicSource.SEMANTIC_SCHOLAR.value,
+            "query": query,
+            "count": 0,
+            "papers": [],
+            "error": str(exc) or f"{type(exc).__name__} with no message.",
+        }
+
+    try:
+        payload = response.json()
+
+    except ValueError as exc:
+        return {
+            "success": False,
+            "source": AcademicSource.SEMANTIC_SCHOLAR.value,
+            "query": query,
+            "count": 0,
+            "papers": [],
+            "error": f"Failed to parse Semantic Scholar response: {exc}",
+        }
+
+    papers = []
+
+    for item in payload.get("data", []):
+
+        semantic_scholar_id = item.get("paperId")
+
+        title = (item.get("title") or "").strip()
+
+        if not title:
+            continue
+
+        # ----------------------------------------------------
+        # Authors
+        # ----------------------------------------------------
+
+        authors = [
+            author.get("name", "").strip()
+            for author in item.get("authors", [])
+            if author.get("name")
+        ]
+
+        # ----------------------------------------------------
+        # External identifiers
+        # ----------------------------------------------------
+
+        external_ids = item.get("externalIds") or {}
+
+        doi = external_ids.get("DOI")
+        arxiv_id = external_ids.get("ArXiv")
+
+        # ----------------------------------------------------
+        # PDF URL
+        # ----------------------------------------------------
+
+        open_access_pdf = item.get("openAccessPdf") or {}
+
+        pdf_url = open_access_pdf.get("url")
+
+        # ----------------------------------------------------
+        # Keywords / fields of study
+        # ----------------------------------------------------
+
+        keywords = item.get("fieldsOfStudy") or []
+
+        # ----------------------------------------------------
+        # Stable internal ID
+        # ----------------------------------------------------
+
+        identity = (
+            doi
+            or arxiv_id
+            or semantic_scholar_id
+            or title
+        )
+
+        paper_id = "paper_" + hashlib.sha256(
+            identity.lower().encode("utf-8")
+        ).hexdigest()[:16]
+
+        # ----------------------------------------------------
+        # Normalize into canonical schema
+        # ----------------------------------------------------
+
+        paper = PaperMetadata(
+            paper_id=paper_id,
+            title=title,
+            authors=authors,
+            abstract=item.get("abstract"),
+            publication_year=item.get("year"),
+            publication_date=item.get("publicationDate"),
+            doi=doi,
+            arxiv_id=arxiv_id,
+            venue=item.get("venue"),
+            source=AcademicSource.SEMANTIC_SCHOLAR,
+            source_id=semantic_scholar_id,
+            landing_url=item.get("url"),
+            pdf_url=pdf_url,
+            citation_count=item.get("citationCount"),
+            keywords=keywords,
+        )
+
+        papers.append(
+            paper.model_dump(mode="json")
+        )
+
+    return {
+        "success": True,
+        "source": AcademicSource.SEMANTIC_SCHOLAR.value,
+        "query": query,
+        "count": len(papers),
+        "papers": papers,
+        "error": None,
+    }
 
 
-def search_tavily(query: str) -> dict:
+def reconstruct_openalex_abstract(
+    inverted_index: dict | None,
+) -> str | None:
     """
-    Search the web using Tavily for contextual information.
+    Reconstruct normal abstract text from OpenAlex's
+    abstract_inverted_index representation.
     """
-    pass
+
+    if not inverted_index:
+        return None
+
+    positions = []
+
+    for word, indexes in inverted_index.items():
+        for index in indexes:
+            positions.append(
+                (index, word)
+            )
+
+    positions.sort(
+        key=lambda item: item[0]
+    )
+
+    return " ".join(
+        word
+        for _, word in positions
+    )
+
+async def search_openalex(
+    query: str,
+    max_results: int = 10,
+) -> dict:
+    """
+    Search OpenAlex for candidate research papers.
+
+    This function only executes the provided search query.
+    It does not generate queries, deduplicate papers,
+    rank papers, or select papers.
+    """
+
+    max_results = max(1, min(max_results, 100))
+
+    params = {
+        "search": query,
+        "per-page": max_results,
+    }
+
+    if OPENALEX_MAILTO:
+        params["mailto"] = OPENALEX_MAILTO
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                OPENALEX_API_URL,
+                params=params,
+            )
+
+            if response.status_code == 429:
+                return {
+                    "success": False,
+                    "source": AcademicSource.OPENALEX.value,
+                    "query": query,
+                    "count": 0,
+                    "papers": [],
+                    "error": "OpenAlex rate limit exceeded.",
+                }
+
+            response.raise_for_status()
+
+    except httpx.HTTPError as exc:
+        return {
+            "success": False,
+            "source": AcademicSource.OPENALEX.value,
+            "query": query,
+            "count": 0,
+            "papers": [],
+            "error": str(exc) or f"{type(exc).__name__} with no message.",
+        }
+
+    try:
+        payload = response.json()
+
+    except ValueError as exc:
+        return {
+            "success": False,
+            "source": AcademicSource.OPENALEX.value,
+            "query": query,
+            "count": 0,
+            "papers": [],
+            "error": f"Failed to parse OpenAlex response: {exc}",
+        }
+
+    papers = []
+
+    for item in payload.get("results", []):
+
+        title = (item.get("title") or "").strip()
+
+        if not title:
+            continue
+
+        # ----------------------------------------------------
+        # OpenAlex source ID
+        # ----------------------------------------------------
+
+        openalex_id = item.get("id")
+
+        if openalex_id:
+            source_id = openalex_id.rstrip("/").split("/")[-1]
+        else:
+            source_id = None
+
+        # ----------------------------------------------------
+        # Authors
+        # ----------------------------------------------------
+
+        authors = []
+
+        for authorship in item.get("authorships", []):
+            author = authorship.get("author") or {}
+            name = author.get("display_name")
+
+            if name:
+                authors.append(name.strip())
+
+        # ----------------------------------------------------
+        # DOI
+        # ----------------------------------------------------
+
+        doi = item.get("doi")
+
+        if doi:
+            doi = doi.replace(
+                "https://doi.org/",
+                ""
+            ).strip()
+
+        # ----------------------------------------------------
+        # arXiv ID
+        # ----------------------------------------------------
+
+        arxiv_id = None
+
+        ids = item.get("ids") or {}
+
+        arxiv_url = ids.get("arxiv")
+
+        if arxiv_url:
+            arxiv_id = (
+                arxiv_url.rstrip("/")
+                .split("/")[-1]
+            )
+
+        # ----------------------------------------------------
+        # Venue
+        # ----------------------------------------------------
+
+        venue = None
+
+        primary_location = (
+            item.get("primary_location") or {}
+        )
+
+        source = (
+            primary_location.get("source") or {}
+        )
+
+        venue = source.get("display_name")
+
+        # ----------------------------------------------------
+        # Landing URL
+        # ----------------------------------------------------
+
+        landing_url = primary_location.get(
+            "landing_page_url"
+        )
+
+        if not landing_url:
+            landing_url = openalex_id
+
+        # ----------------------------------------------------
+        # PDF URL
+        # ----------------------------------------------------
+
+        pdf_url = primary_location.get("pdf_url")
+
+        if not pdf_url:
+
+            best_oa_location = (
+                item.get("best_oa_location") or {}
+            )
+
+            pdf_url = best_oa_location.get("pdf_url")
+
+        # ----------------------------------------------------
+        # Keywords
+        # ----------------------------------------------------
+
+        keywords = []
+
+        for concept in item.get("concepts", []):
+            name = concept.get("display_name")
+
+            if name:
+                keywords.append(name)
+
+        # ----------------------------------------------------
+        # Abstract
+        # ----------------------------------------------------
+
+        abstract = reconstruct_openalex_abstract(
+            item.get("abstract_inverted_index")
+        )
+
+        # ----------------------------------------------------
+        # Stable internal ID
+        # ----------------------------------------------------
+
+        identity = (
+            doi
+            or arxiv_id
+            or source_id
+            or title
+        )
+
+        paper_id = "paper_" + hashlib.sha256(
+            identity.lower().encode("utf-8")
+        ).hexdigest()[:16]
+
+        # ----------------------------------------------------
+        # Normalize
+        # ----------------------------------------------------
+
+        paper = PaperMetadata(
+            paper_id=paper_id,
+            title=title,
+            authors=authors,
+            abstract=abstract,
+            publication_year=item.get(
+                "publication_year"
+            ),
+            publication_date=item.get(
+                "publication_date"
+            ),
+            doi=doi,
+            arxiv_id=arxiv_id,
+            venue=venue,
+            source=AcademicSource.OPENALEX,
+            source_id=source_id,
+            landing_url=landing_url,
+            pdf_url=pdf_url,
+            citation_count=item.get(
+                "cited_by_count"
+            ),
+            keywords=keywords,
+        )
+
+        papers.append(
+            paper.model_dump(mode="json")
+        )
+
+    return {
+        "success": True,
+        "source": AcademicSource.OPENALEX.value,
+        "query": query,
+        "count": len(papers),
+        "papers": papers,
+        "error": None,
+    }
+
+
+def parse_crossref_date(
+    date_data: dict | None,
+) -> tuple[int | None, str | None]:
+    """
+    Convert Crossref date-parts into publication year
+    and an ISO-like publication date.
+    """
+
+    if not date_data:
+        return None, None
+
+    date_parts = date_data.get("date-parts")
+
+    if not date_parts or not date_parts[0]:
+        return None, None
+
+    parts = date_parts[0]
+
+    try:
+        year = int(parts[0])
+    except (TypeError, ValueError, IndexError):
+        return None, None
+
+    if len(parts) >= 3:
+        publication_date = (
+            f"{year:04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
+        )
+    elif len(parts) >= 2:
+        publication_date = (
+            f"{year:04d}-{int(parts[1]):02d}"
+        )
+    else:
+        publication_date = str(year)
+
+    return year, publication_date
+
+async def search_crossref(
+    query: str,
+    max_results: int = 10,
+) -> dict:
+    """
+    Search Crossref for candidate scholarly works.
+
+    This function only executes the provided query.
+    It does not generate search queries, deduplicate papers,
+    rank papers, or select papers.
+    """
+
+    max_results = max(1, min(max_results, 100))
+
+    params = {
+        "query.bibliographic": query,
+        "rows": max_results,
+        "select": (
+            "DOI,title,author,abstract,published,"
+            "published-print,published-online,"
+            "container-title,URL,link,is-referenced-by-count,"
+            "subject"
+        ),
+    }
+
+    if CROSSREF_MAILTO:
+        params["mailto"] = CROSSREF_MAILTO
+
+    headers = {
+        "User-Agent": (
+            "MultiAgentResearchSystem/1.0"
+            + (
+                f" (mailto:{CROSSREF_MAILTO})"
+                if CROSSREF_MAILTO
+                else ""
+            )
+        )
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                CROSSREF_API_URL,
+                params=params,
+                headers=headers,
+            )
+
+            if response.status_code == 429:
+                return {
+                    "success": False,
+                    "source": AcademicSource.CROSSREF.value,
+                    "query": query,
+                    "count": 0,
+                    "papers": [],
+                    "error": "Crossref rate limit exceeded.",
+                }
+
+            response.raise_for_status()
+
+    except httpx.HTTPError as exc:
+        return {
+            "success": False,
+            "source": AcademicSource.CROSSREF.value,
+            "query": query,
+            "count": 0,
+            "papers": [],
+            "error": str(exc) or f"{type(exc).__name__} with no message.",
+        }
+
+    try:
+        payload = response.json()
+
+    except ValueError as exc:
+        return {
+            "success": False,
+            "source": AcademicSource.CROSSREF.value,
+            "query": query,
+            "count": 0,
+            "papers": [],
+            "error": f"Failed to parse Crossref response: {exc}",
+        }
+
+    papers = []
+
+    items = (
+        payload.get("message", {})
+        .get("items", [])
+    )
+
+    for item in items:
+
+        # ----------------------------------------------------
+        # Title
+        # ----------------------------------------------------
+
+        titles = item.get("title") or []
+
+        title = (
+            titles[0].strip()
+            if titles
+            else ""
+        )
+
+        if not title:
+            continue
+
+        # ----------------------------------------------------
+        # Authors
+        # ----------------------------------------------------
+
+        authors = []
+
+        for author in item.get("author", []):
+            given = (author.get("given") or "").strip()
+            family = (author.get("family") or "").strip()
+
+            full_name = " ".join(
+                part
+                for part in [given, family]
+                if part
+            )
+
+            if full_name:
+                authors.append(full_name)
+
+        # ----------------------------------------------------
+        # DOI
+        # ----------------------------------------------------
+
+        doi = item.get("DOI")
+
+        if doi:
+            doi = doi.strip().lower()
+
+        # ----------------------------------------------------
+        # Publication date
+        # ----------------------------------------------------
+
+        date_data = (
+            item.get("published")
+            or item.get("published-print")
+            or item.get("published-online")
+        )
+
+        publication_year, publication_date = (
+            parse_crossref_date(date_data)
+        )
+
+        # ----------------------------------------------------
+        # Venue
+        # ----------------------------------------------------
+
+        container_titles = (
+            item.get("container-title") or []
+        )
+
+        venue = (
+            container_titles[0].strip()
+            if container_titles
+            else None
+        )
+
+        # ----------------------------------------------------
+        # Abstract
+        # ----------------------------------------------------
+
+        abstract = item.get("abstract")
+
+        if abstract:
+            abstract = " ".join(
+                abstract.split()
+            )
+
+        # ----------------------------------------------------
+        # Subject / keywords
+        # ----------------------------------------------------
+
+        keywords = [
+            subject.strip()
+            for subject in (item.get("subject") or [])
+            if subject and subject.strip()
+        ]
+
+        # ----------------------------------------------------
+        # PDF URL
+        # ----------------------------------------------------
+
+        pdf_url = None
+
+        for link in item.get("link", []) or []:
+
+            content_type = (
+                link.get("content-type") or ""
+            ).lower()
+
+            url = link.get("URL")
+
+            if url and content_type == "application/pdf":
+                pdf_url = url
+                break
+
+        # ----------------------------------------------------
+        # Stable internal ID
+        # ----------------------------------------------------
+
+        identity = (
+            doi
+            or item.get("URL")
+            or title
+        )
+
+        paper_id = "paper_" + hashlib.sha256(
+            identity.lower().encode("utf-8")
+        ).hexdigest()[:16]
+
+        # ----------------------------------------------------
+        # Normalize into PaperMetadata
+        # ----------------------------------------------------
+
+        paper = PaperMetadata(
+            paper_id=paper_id,
+            title=title,
+            authors=authors,
+            abstract=abstract,
+            publication_year=publication_year,
+            publication_date=publication_date,
+            doi=doi,
+            arxiv_id=None,
+            venue=venue,
+            source=AcademicSource.CROSSREF,
+            source_id=doi,
+            landing_url=item.get("URL"),
+            pdf_url=pdf_url,
+            citation_count=item.get(
+                "is-referenced-by-count"
+            ),
+            keywords=keywords,
+        )
+
+        papers.append(
+            paper.model_dump(mode="json")
+        )
+
+    return {
+        "success": True,
+        "source": AcademicSource.CROSSREF.value,
+        "query": query,
+        "count": len(papers),
+        "papers": papers,
+        "error": None,
+    }
+
+
+async def search_tavily(
+    query: str,
+    max_results: int = 5,
+) -> dict:
+    """
+    Search the web using Tavily.
+
+    Tavily is used for supporting web context rather than
+    canonical academic paper retrieval.
+
+    This function only executes a query provided by the
+    Root Agent. It does not generate search queries,
+    deduplicate papers, rank papers, or select papers.
+    """
+
+    max_results = max(1, min(max_results, 20))
+
+    if not TAVILY_API_KEY:
+        return {
+            "success": False,
+            "source": AcademicSource.TAVILY.value,
+            "query": query,
+            "count": 0,
+            "web_sources": [],
+            "error": "TAVILY_API_KEY is not configured.",
+        }
+
+    headers = {
+        "Authorization": f"Bearer {TAVILY_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "query": query,
+        "search_depth": "basic",
+        "max_results": max_results,
+        "include_answer": False,
+        "include_raw_content": False,
+        "include_images": False,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                TAVILY_API_URL,
+                json=payload,
+                headers=headers,
+            )
+
+            if response.status_code == 401:
+                return {
+                    "success": False,
+                    "source": AcademicSource.TAVILY.value,
+                    "query": query,
+                    "count": 0,
+                    "web_sources": [],
+                    "error": "Invalid or missing Tavily API key.",
+                }
+
+            if response.status_code == 429:
+                return {
+                    "success": False,
+                    "source": AcademicSource.TAVILY.value,
+                    "query": query,
+                    "count": 0,
+                    "web_sources": [],
+                    "error": "Tavily rate limit exceeded.",
+                }
+
+            response.raise_for_status()
+
+    except httpx.HTTPError as exc:
+        return {
+            "success": False,
+            "source": AcademicSource.TAVILY.value,
+            "query": query,
+            "count": 0,
+            "web_sources": [],
+            "error": str(exc) or f"{type(exc).__name__} with no message.",
+        }
+
+    try:
+        data = response.json()
+
+    except ValueError as exc:
+        return {
+            "success": False,
+            "source": AcademicSource.TAVILY.value,
+            "query": query,
+            "count": 0,
+            "web_sources": [],
+            "error": f"Failed to parse Tavily response: {exc}",
+        }
+
+    web_sources = []
+
+    for index, item in enumerate(data.get("results", []), start=1):
+
+        title = (item.get("title") or "").strip()
+        url = (item.get("url") or "").strip()
+
+        if not title or not url:
+            continue
+
+        identity = f"{query}:{url}"
+
+        source_id = "web_" + hashlib.sha256(
+            identity.encode("utf-8")
+        ).hexdigest()[:16]
+
+        source = WebSource(
+            source_id=source_id,
+            title=title,
+            url=url,
+            content=item.get("content"),
+            query_id=None,
+        )
+
+        web_sources.append(
+            source.model_dump(mode="json")
+        )
+
+    return {
+        "success": True,
+        "source": AcademicSource.TAVILY.value,
+        "query": query,
+        "count": len(web_sources),
+        "web_sources": web_sources,
+        "error": None,
+    }
 
 
 # ============================================================
 # ANALYSIS AGENT TOOLS
 # ============================================================
 
+def normalize_doi_for_dedup(doi: str | None) -> str | None:
+    """
+    Normalize a DOI for duplicate matching.
+    """
+
+    if not doi:
+        return None
+
+    normalized = doi.strip().lower()
+
+    normalized = normalized.replace(
+        "https://doi.org/", ""
+    ).replace(
+        "http://doi.org/", ""
+    )
+
+    return normalized or None
+
+
+def normalize_arxiv_id_for_dedup(arxiv_id: str | None) -> str | None:
+    """
+    Normalize an arXiv ID for duplicate matching.
+
+    Different versions of the same paper (e.g. "2203.08975v1" and
+    "2203.08975v2") must be treated as the same paper, so the
+    version suffix is stripped.
+    """
+
+    if not arxiv_id:
+        return None
+
+    normalized = arxiv_id.strip().lower()
+    normalized = re.sub(r"v\d+$", "", normalized)
+
+    return normalized or None
+
+
+def normalize_title_for_dedup(title: str | None) -> str | None:
+    """
+    Normalize a title for duplicate matching by lowercasing and
+    collapsing all non-alphanumeric characters to single spaces.
+
+    This tolerates minor punctuation/whitespace differences between
+    sources without doing any fuzzy/approximate matching.
+    """
+
+    if not title:
+        return None
+
+    normalized = re.sub(
+        r"[^a-z0-9]+", " ", title.lower()
+    ).strip()
+
+    return normalized or None
+
+
 def deduplicate_papers(papers: list[dict]) -> dict:
     """
     Detect and remove duplicate papers retrieved from multiple
     academic databases.
+
+    This does not rank or select papers; it only collapses records
+    that describe the same underlying paper into one record.
+
+    Duplicate matching priority (checked in this order):
+        1. Normalized DOI
+        2. Normalized arXiv ID (version suffix ignored)
+        3. Normalized title
+
+    When two records are judged to be the same paper, the first
+    encountered record is kept and enriched with any fields the
+    duplicate provides that the kept record is missing. Existing
+    fields on the kept record are never overwritten, and no field
+    values are invented.
     """
-    pass
+
+    kept_papers: list[dict] = []
+    key_to_index: dict[tuple[str, str], int] = {}
+    duplicate_groups: list[dict] = []
+
+    enrichable_fields = [
+        "abstract",
+        "doi",
+        "arxiv_id",
+        "venue",
+        "publication_year",
+        "publication_date",
+        "landing_url",
+        "pdf_url",
+        "citation_count",
+    ]
+
+    for paper in papers:
+
+        candidate_keys = []
+
+        doi_key = normalize_doi_for_dedup(paper.get("doi"))
+        if doi_key:
+            candidate_keys.append(("doi", doi_key))
+
+        arxiv_key = normalize_arxiv_id_for_dedup(paper.get("arxiv_id"))
+        if arxiv_key:
+            candidate_keys.append(("arxiv", arxiv_key))
+
+        title_key = normalize_title_for_dedup(paper.get("title"))
+        if title_key:
+            candidate_keys.append(("title", title_key))
+
+        # ------------------------------------------------------
+        # Find an existing match, checking DOI first, then
+        # arXiv ID, then title.
+        # ------------------------------------------------------
+
+        match_index = None
+        match_type = None
+
+        for key in candidate_keys:
+            if key in key_to_index:
+                match_index = key_to_index[key]
+                match_type = key[0]
+                break
+
+        if match_index is None:
+
+            # Previously unseen paper.
+            kept_papers.append(paper)
+            new_index = len(kept_papers) - 1
+
+            for key in candidate_keys:
+                key_to_index[key] = new_index
+
+            duplicate_groups.append(
+                {
+                    "kept_paper_id": paper.get("paper_id"),
+                    "removed": [],
+                }
+            )
+
+            continue
+
+        # ------------------------------------------------------
+        # Duplicate found: enrich the kept record and record
+        # which paper_id was merged away.
+        # ------------------------------------------------------
+
+        kept_paper = kept_papers[match_index]
+
+        for field in enrichable_fields:
+            if not kept_paper.get(field) and paper.get(field):
+                kept_paper[field] = paper[field]
+
+        # Union keywords while preserving order.
+        existing_keywords = kept_paper.get("keywords") or []
+
+        for keyword in paper.get("keywords") or []:
+            if keyword not in existing_keywords:
+                existing_keywords.append(keyword)
+
+        kept_paper["keywords"] = existing_keywords
+
+        if not kept_paper.get("authors") and paper.get("authors"):
+            kept_paper["authors"] = paper["authors"]
+
+        # Register this paper's keys too, so a later paper can
+        # match this group through any known identifier.
+        for key in candidate_keys:
+            key_to_index[key] = match_index
+
+        duplicate_groups[match_index]["removed"].append(
+            {
+                "paper_id": paper.get("paper_id"),
+                "match_type": match_type,
+            }
+        )
+
+    # ------------------------------------------------------------
+    # Re-validate every kept record against the canonical schema
+    # so a merge can never leave a paper in an inconsistent shape.
+    # ------------------------------------------------------------
+
+    validated_papers = [
+        PaperMetadata.model_validate(paper).model_dump(mode="json")
+        for paper in kept_papers
+    ]
+
+    return {
+        "papers": validated_papers,
+        "original_count": len(papers),
+        "deduplicated_count": len(validated_papers),
+        "duplicates_removed": len(papers) - len(validated_papers),
+        "duplicate_groups": [
+            group
+            for group in duplicate_groups
+            if group["removed"]
+        ],
+    }
+
+
+_RERANK_STOPWORDS = {
+    "a", "an", "the", "of", "in", "on", "for", "and", "or", "to",
+    "is", "are", "with", "using", "based", "by", "from", "at",
+    "as", "into", "this", "that", "their", "its", "be", "how",
+    "what", "which", "study", "review",
+}
+
+
+def tokenize_for_rerank(text: str | None) -> set[str]:
+    """
+    Lowercase a string and split it into a set of comparable
+    words, dropping stopwords and very short tokens.
+
+    A set is intentional: this scores WHICH query terms are
+    present, not how many times, so repeated words don't inflate
+    a paper's relevance.
+    """
+
+    if not text:
+        return set()
+
+    words = re.findall(r"[a-z0-9]+", text.lower())
+
+    return {
+        word
+        for word in words
+        if len(word) > 2 and word not in _RERANK_STOPWORDS
+    }
 
 
 def rerank_papers(
     papers: list[dict],
-    research_question: str
+    research_question: str,
 ) -> dict:
     """
-    Re-rank candidate papers according to their relevance to
-    the research question.
+    Re-rank candidate papers according to their lexical relevance
+    to the research question.
+
+    This is deterministic term-overlap scoring, not an LLM
+    judgment call. It gives the Analysis Agent a reproducible
+    relevance signal to reason over; it does not select or
+    discard papers.
+
+    Scoring:
+        - Query terms found in a paper's TITLE count double.
+        - Query terms found only in the abstract/keywords count
+          once.
+        - The score is normalized to [0.0, 1.0] by the maximum
+          possible weighted match count.
+
+    Papers are ordered by score (descending), then by
+    citation_count (descending, missing treated as 0), then by
+    title (alphabetically) so the ordering is fully deterministic
+    even when scores tie.
     """
-    pass
+
+    query_tokens = tokenize_for_rerank(research_question)
+
+    scored_papers = []
+
+    for paper in papers:
+
+        title_tokens = tokenize_for_rerank(paper.get("title"))
+
+        body_tokens = tokenize_for_rerank(
+            paper.get("abstract")
+        ) | tokenize_for_rerank(
+            " ".join(paper.get("keywords") or [])
+        )
+
+        matched_in_title = query_tokens & title_tokens
+        matched_in_body = (query_tokens & body_tokens) - matched_in_title
+
+        max_possible = 2 * len(query_tokens)
+
+        if max_possible:
+            weighted_matches = (
+                2 * len(matched_in_title) + len(matched_in_body)
+            )
+            relevance_score = weighted_matches / max_possible
+        else:
+            relevance_score = 0.0
+
+        if not query_tokens:
+            ranking_reason = (
+                "Research question produced no comparable terms."
+            )
+        else:
+            ranking_reason = (
+                f"{len(matched_in_title)} query term(s) matched in "
+                f"the title, {len(matched_in_body)} matched in the "
+                f"abstract/keywords, out of {len(query_tokens)} "
+                f"distinct query term(s)."
+            )
+
+        scored_papers.append(
+            {
+                "paper_id": paper.get("paper_id"),
+                "title": paper.get("title") or "",
+                "citation_count": paper.get("citation_count") or 0,
+                "relevance_score": round(relevance_score, 4),
+                "ranking_reason": ranking_reason,
+            }
+        )
+
+    scored_papers.sort(
+        key=lambda item: (
+            -item["relevance_score"],
+            -item["citation_count"],
+            item["title"],
+        )
+    )
+
+    ranked_papers = [
+        RankedPaper(
+            paper_id=paper["paper_id"],
+            rank=rank,
+            relevance_score=paper["relevance_score"],
+            ranking_reason=paper["ranking_reason"],
+        ).model_dump(mode="json")
+        for rank, paper in enumerate(scored_papers, start=1)
+    ]
+
+    return {
+        "ranked_papers": ranked_papers,
+        "research_question": research_question,
+        "paper_count": len(ranked_papers),
+    }
 
 
-def download_pdf(pdf_url: str, paper_id: str) -> dict:
+def select_papers(
+    ranked_papers: list[dict],
+    max_papers: int = 20,
+    min_relevance_score: float = 0.0,
+) -> dict:
+    """
+    Select papers for deep analysis from a ranked-paper list.
+
+    This is a deterministic baseline selection policy, not an LLM
+    judgment call. It gives the Analysis Agent a reproducible
+    starting corpus; it does not evaluate topical coverage or
+    diversity across the selected papers - that judgment, if
+    needed, is the Analysis Agent's responsibility.
+
+    Selection policy (applied in this order):
+        1. Discard any paper whose relevance_score is below
+           min_relevance_score.
+        2. Of the remaining papers, keep at most max_papers,
+           preferring the best (lowest) rank first.
+
+    Args:
+        ranked_papers:
+            RankedPaper-shaped dicts, as produced by
+            rerank_papers()["ranked_papers"]. Not required to be
+            pre-sorted.
+
+        max_papers:
+            Maximum number of papers to select. Values below 1 are
+            treated as 1.
+
+        min_relevance_score:
+            Minimum relevance_score (inclusive) a paper must have
+            to be eligible for selection.
+
+    Returns:
+        selected_paper_ids, selected_papers (kept, ordered by
+        rank), excluded_papers (paper_id + exclusion reason), and
+        counts.
+    """
+
+    max_papers = max(1, max_papers)
+
+    sorted_papers = sorted(
+        ranked_papers,
+        key=lambda paper: paper["rank"],
+    )
+
+    selected_papers = []
+    excluded_papers = []
+
+    for paper in sorted_papers:
+
+        if paper.get("relevance_score", 0.0) < min_relevance_score:
+            excluded_papers.append(
+                {
+                    "paper_id": paper.get("paper_id"),
+                    "reason": "below_relevance_threshold",
+                }
+            )
+            continue
+
+        if len(selected_papers) >= max_papers:
+            excluded_papers.append(
+                {
+                    "paper_id": paper.get("paper_id"),
+                    "reason": "max_papers_reached",
+                }
+            )
+            continue
+
+        selected_papers.append(paper)
+
+    return {
+        "selected_paper_ids": [
+            paper["paper_id"] for paper in selected_papers
+        ],
+        "selected_papers": selected_papers,
+        "excluded_papers": excluded_papers,
+        "candidate_count": len(ranked_papers),
+        "selected_count": len(selected_papers),
+        "excluded_count": len(excluded_papers),
+    }
+
+
+async def download_pdf(
+    pdf_url: str | None,
+    paper_id: str,
+) -> dict:
     """
     Download the PDF associated with a selected research paper.
+
+    Writes the file to PAPERS_DIR/<paper_id>/<paper_id>.pdf and
+    reports the outcome using the same RetrievalStatus values
+    RetrievedPaper uses (downloaded/failed), so the Analysis Agent's
+    result can be carried straight into ResearchState without
+    translation.
+
+    This function does not choose which papers to download; it
+    only executes a single download that has already been decided
+    upstream (by select_papers).
+
+    A missing pdf_url is an expected, common case - many academic
+    records have no open-access PDF - so it is reported as a failed
+    retrieval rather than treated as an unexpected error.
     """
-    pass
+
+    if not pdf_url:
+        return {
+            "paper_id": paper_id,
+            "pdf_url": pdf_url,
+            "pdf_path": None,
+            "retrieval_status": RetrievalStatus.FAILED.value,
+            "retrieval_error": "No pdf_url was available for this paper.",
+        }
+
+    paper_dir = os.path.join(PAPERS_DIR, paper_id)
+    destination_path = os.path.join(paper_dir, f"{paper_id}.pdf")
+
+    downloaded_bytes = bytearray()
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=60.0,
+            follow_redirects=True,
+        ) as client:
+
+            async with client.stream("GET", pdf_url) as response:
+
+                if response.status_code != 200:
+                    return {
+                        "paper_id": paper_id,
+                        "pdf_url": pdf_url,
+                        "pdf_path": None,
+                        "retrieval_status": RetrievalStatus.FAILED.value,
+                        "retrieval_error": (
+                            f"PDF request failed with HTTP "
+                            f"{response.status_code}."
+                        ),
+                    }
+
+                content_length = response.headers.get("content-length")
+
+                if (
+                    content_length
+                    and int(content_length) > MAX_PDF_DOWNLOAD_BYTES
+                ):
+                    return {
+                        "paper_id": paper_id,
+                        "pdf_url": pdf_url,
+                        "pdf_path": None,
+                        "retrieval_status": RetrievalStatus.FAILED.value,
+                        "retrieval_error": (
+                            "PDF exceeds the maximum allowed download "
+                            f"size ({MAX_PDF_DOWNLOAD_BYTES} bytes)."
+                        ),
+                    }
+
+                async for chunk in response.aiter_bytes():
+                    downloaded_bytes.extend(chunk)
+
+                    if len(downloaded_bytes) > MAX_PDF_DOWNLOAD_BYTES:
+                        return {
+                            "paper_id": paper_id,
+                            "pdf_url": pdf_url,
+                            "pdf_path": None,
+                            "retrieval_status": RetrievalStatus.FAILED.value,
+                            "retrieval_error": (
+                                "PDF download exceeded the maximum "
+                                f"allowed size ({MAX_PDF_DOWNLOAD_BYTES} "
+                                "bytes) while streaming."
+                            ),
+                        }
+
+    except httpx.HTTPError as exc:
+        return {
+            "paper_id": paper_id,
+            "pdf_url": pdf_url,
+            "pdf_path": None,
+            "retrieval_status": RetrievalStatus.FAILED.value,
+            "retrieval_error": str(exc) or f"{type(exc).__name__} with no message.",
+        }
+
+    if not downloaded_bytes.startswith(b"%PDF"):
+        return {
+            "paper_id": paper_id,
+            "pdf_url": pdf_url,
+            "pdf_path": None,
+            "retrieval_status": RetrievalStatus.FAILED.value,
+            "retrieval_error": (
+                "Downloaded content is not a valid PDF (missing %PDF "
+                "header) - likely an HTML error or paywall page."
+            ),
+        }
+
+    os.makedirs(paper_dir, exist_ok=True)
+
+    with open(destination_path, "wb") as pdf_file:
+        pdf_file.write(downloaded_bytes)
+
+    return {
+        "paper_id": paper_id,
+        "pdf_url": pdf_url,
+        "pdf_path": destination_path,
+        "retrieval_status": RetrievalStatus.DOWNLOADED.value,
+        "retrieval_error": None,
+    }
 
 
 def render_pdf_pages(pdf_path: str) -> dict:
     """
-    Render all pages of a research-paper PDF as images for
-    vision-language-model analysis.
+    Render every page of a downloaded research-paper PDF as a
+    complete page image, for vision-language-model analysis.
+
+    This intentionally renders whole pages (text, figures, tables,
+    equations, layout, captions - everything as the VLM will see
+    it) rather than extracting text/tables/images separately. There
+    is no OCR/text-extraction pipeline here by design.
+
+    Pages are written next to the PDF, in a "pages" subfolder of
+    the PDF's own directory:
+
+        <pdf_path's directory>/pages/page_0001.png
+        <pdf_path's directory>/pages/page_0002.png
+        ...
+
+    Since download_pdf() writes each PDF to
+    PAPERS_DIR/<paper_id>/<paper_id>.pdf, this naturally produces:
+
+        PAPERS_DIR/<paper_id>/pages/page_0001.png
+
+    Rendered at PAGE_RENDER_DPI (see config.py).
     """
-    pass
+
+    if not os.path.isfile(pdf_path):
+        return {
+            "pdf_path": pdf_path,
+            "pages_dir": None,
+            "page_image_paths": [],
+            "page_count": 0,
+            "success": False,
+            "error": f"No PDF file found at: {pdf_path}",
+        }
+
+    paper_dir = os.path.dirname(pdf_path)
+    pages_dir = os.path.join(paper_dir, "pages")
+
+    try:
+        document = pymupdf.open(pdf_path)
+
+    except Exception as exc:
+        return {
+            "pdf_path": pdf_path,
+            "pages_dir": None,
+            "page_image_paths": [],
+            "page_count": 0,
+            "success": False,
+            "error": f"Failed to open PDF: {exc}",
+        }
+
+    os.makedirs(pages_dir, exist_ok=True)
+
+    # 72 is PDF's native points-per-inch; fitz's zoom factor is
+    # relative to that, so this converts a target DPI into the
+    # zoom matrix PyMuPDF expects.
+    zoom = PAGE_RENDER_DPI / 72.0
+    render_matrix = pymupdf.Matrix(zoom, zoom)
+
+    page_image_paths = []
+
+    try:
+        for page_index, page in enumerate(document):
+
+            pixmap = page.get_pixmap(matrix=render_matrix)
+
+            image_path = os.path.join(
+                pages_dir,
+                f"page_{page_index + 1:04d}.png",
+            )
+
+            pixmap.save(image_path)
+            page_image_paths.append(image_path)
+
+    finally:
+        document.close()
+
+    return {
+        "pdf_path": pdf_path,
+        "pages_dir": pages_dir,
+        "page_image_paths": page_image_paths,
+        "page_count": len(page_image_paths),
+        "success": True,
+        "error": None,
+    }
+
+
+def parse_page_number_from_image_path(image_path: str) -> int | None:
+    """
+    Extract the 1-based page number from a rendered page image's
+    filename, e.g. ".../pages/page_0001.png" -> 1.
+
+    Matches the naming convention render_pdf_pages() writes
+    (page_{n:04d}.png). The page number is taken from the filename,
+    never from the VLM's own response, so a page can never be
+    mislabeled even if the model's output is imperfect.
+    """
+
+    match = re.search(r"page_(\d+)\.png$", os.path.basename(image_path))
+
+    if not match:
+        return None
+
+    return int(match.group(1))
+
+
+def is_retryable_vlm_error(exc: Exception) -> bool:
+    """
+    True only for transient failures worth retrying once: a request
+    timeout, or a 5xx from the provider's own gateway. Never retries
+    on anything else (bad request, auth failure, malformed input,
+    etc.) - those will not succeed on a second attempt.
+    """
+
+    if isinstance(exc, litellm.Timeout):
+        return True
+
+    status_code = getattr(exc, "status_code", None)
+    return status_code is not None and 500 <= status_code < 600
+
+
+def parse_vlm_json_array(raw_output: str | None) -> list[dict] | None:
+    """
+    Parse the VLM's raw text response into a JSON array of per-page
+    objects.
+
+    VLM_PAGE_ANALYSIS_PROMPT instructs the model to return only a
+    JSON array, but some models wrap output in markdown code fences
+    anyway, so those are stripped before parsing. Returns None
+    (never a guess/fabricated structure) if the result isn't valid
+    JSON or isn't a list.
+    """
+
+    if not raw_output:
+        return None
+
+    text = raw_output.strip()
+
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.startswith("json"):
+            text = text[len("json"):]
+        text = text.strip()
+
+    try:
+        parsed = json.loads(text)
+
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(parsed, list):
+        return None
+
+    return parsed
+
+
+async def analyze_pages_with_vlm(
+    paper_id: str,
+    page_image_paths: list[str],
+) -> dict:
+    """
+    Vision-analyze already-rendered PDF page images for one paper
+    using the vision-language model, and return a structured
+    PageAnalysis per page.
+
+    Pages are sent VLM_PAGES_PER_CALL at a time, as separate
+    full-resolution images within a single model call (never
+    composited into one image), reducing the number of VLM requests
+    without shrinking any individual page's resolution.
+
+    This performs the vision inference directly (via the same model
+    configured as ANALYSIS_MODEL) rather than relying on the calling
+    agent's own conversation turn to see the images: the chat-completions
+    protocol only allows images inside user-role message content, never
+    inside a tool/function result, so a tool returning raw image bytes
+    could not be "seen" by the agent's own turn anyway.
+
+    A batch that fails (transport error, malformed JSON, wrong number
+    of objects returned) is reported as a structured failure for
+    exactly the pages in that batch - it never invents PageAnalysis
+    content - and does not prevent other batches for the same paper
+    from succeeding.
+    """
+
+    page_analyses: list[dict] = []
+    failed_pages: list[dict] = []
+
+    batches = [
+        page_image_paths[i:i + VLM_PAGES_PER_CALL]
+        for i in range(0, len(page_image_paths), VLM_PAGES_PER_CALL)
+    ]
+
+    for batch in batches:
+
+        batch_page_numbers = [
+            parse_page_number_from_image_path(image_path)
+            for image_path in batch
+        ]
+
+        try:
+            message_content = [
+                {
+                    "type": "text",
+                    "text": f"Analyze the following {len(batch)} page(s), in order.",
+                }
+            ]
+
+            for image_path in batch:
+                with open(image_path, "rb") as image_file:
+                    encoded_image = base64.b64encode(
+                        image_file.read()
+                    ).decode("ascii")
+
+                message_content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{encoded_image}"
+                        },
+                    }
+                )
+
+            raw_output = None
+            call_error = None
+
+            # One retry, and only for a transient timeout/5xx - not
+            # for errors that would fail again identically (bad
+            # request, auth, etc).
+            for attempt in range(2):
+                try:
+                    response = await litellm.acompletion(
+                        model=f"nvidia_nim/{ANALYSIS_MODEL_NAME}",
+                        api_key=NVIDIA_NIM_API_KEY,
+                        api_base=NVIDIA_NIM_API_BASE,
+                        messages=[
+                            {"role": "system", "content": VLM_PAGE_ANALYSIS_PROMPT},
+                            {"role": "user", "content": message_content},
+                        ],
+                    )
+                    raw_output = response.choices[0].message.content
+                    call_error = None
+                    break
+
+                except Exception as exc:
+                    call_error = exc
+                    if attempt == 0 and is_retryable_vlm_error(exc):
+                        continue
+                    break
+
+            if call_error is not None:
+                raise call_error
+
+        except Exception as exc:
+            for image_path, page_number in zip(batch, batch_page_numbers):
+                failed_pages.append(
+                    {
+                        "paper_id": paper_id,
+                        "page_number": page_number,
+                        "image_path": image_path,
+                        "error": f"VLM request failed: {exc}",
+                    }
+                )
+            continue
+
+        parsed_pages = parse_vlm_json_array(raw_output)
+
+        if parsed_pages is None or len(parsed_pages) != len(batch):
+            for image_path, page_number in zip(batch, batch_page_numbers):
+                failed_pages.append(
+                    {
+                        "paper_id": paper_id,
+                        "page_number": page_number,
+                        "image_path": image_path,
+                        "error": (
+                            "VLM response was not a JSON array with "
+                            f"one object per page (expected {len(batch)})."
+                        ),
+                    }
+                )
+            continue
+
+        for image_path, page_number, page_data in zip(
+            batch, batch_page_numbers, parsed_pages
+        ):
+
+            if page_number is None:
+                failed_pages.append(
+                    {
+                        "paper_id": paper_id,
+                        "page_number": None,
+                        "image_path": image_path,
+                        "error": (
+                            "Could not determine page number from "
+                            f"image filename: {image_path}"
+                        ),
+                    }
+                )
+                continue
+
+            try:
+                page_analysis = PageAnalysis.model_validate(
+                    {
+                        "paper_id": paper_id,
+                        "page_number": page_number,
+                        "image_path": image_path,
+                        **page_data,
+                    }
+                )
+
+            except Exception as exc:
+                failed_pages.append(
+                    {
+                        "paper_id": paper_id,
+                        "page_number": page_number,
+                        "image_path": image_path,
+                        "error": f"PageAnalysis validation failed: {exc}",
+                    }
+                )
+                continue
+
+            page_analyses.append(page_analysis.model_dump(mode="json"))
+
+    return {
+        "paper_id": paper_id,
+        "requested_page_count": len(page_image_paths),
+        "analyzed_page_count": len(page_analyses),
+        "page_analyses": page_analyses,
+        "failed_pages": failed_pages,
+        "success": len(failed_pages) < len(page_image_paths),
+    }
+
+
+def build_paper_analysis(
+    paper_id: str,
+    page_analyses: list[dict],
+    research_objective: str | None = None,
+    methodology: str | None = None,
+    datasets: list[str] | None = None,
+    experimental_setup: str | None = None,
+    metrics: dict[str, str] | None = None,
+    key_findings: list[str] | None = None,
+    contributions: list[str] | None = None,
+    limitations: list[str] | None = None,
+    future_work: list[str] | None = None,
+) -> dict:
+    """
+    Assemble and validate one paper's structured PaperAnalysis.
+
+    Combining page-level understanding into a paper-level synthesis
+    (what is this paper's methodology, what did it actually
+    contribute, etc.) is judgment the Analysis Agent works out itself
+    from the page_analyses it already has - this function does not
+    do that reasoning. It only validates the agent's synthesized
+    fields against the canonical PaperAnalysis schema and re-attaches
+    the already-produced page_analyses deterministically, so they
+    never have to be (and cannot be garbled by) re-typing them.
+
+    evidence is intentionally left empty here - Evidence generation
+    is a separate, later step, not part of this assembly.
+
+    Returns a structured validation failure (never a fabricated or
+    partially-coerced PaperAnalysis) if the supplied fields don't
+    satisfy the schema.
+    """
+
+    try:
+        paper_analysis = PaperAnalysis.model_validate(
+            {
+                "paper_id": paper_id,
+                "research_objective": research_objective,
+                "methodology": methodology,
+                "datasets": datasets or [],
+                "experimental_setup": experimental_setup,
+                "metrics": metrics or {},
+                "key_findings": key_findings or [],
+                "contributions": contributions or [],
+                "limitations": limitations or [],
+                "future_work": future_work or [],
+                "page_analyses": page_analyses,
+                "evidence": [],
+            }
+        )
+
+    except Exception as exc:
+        return {
+            "paper_id": paper_id,
+            "paper_analysis": None,
+            "success": False,
+            "error": f"PaperAnalysis validation failed: {exc}",
+        }
+
+    return {
+        "paper_id": paper_id,
+        "paper_analysis": paper_analysis.model_dump(mode="json"),
+        "success": True,
+        "error": None,
+    }
 
 
 # ============================================================

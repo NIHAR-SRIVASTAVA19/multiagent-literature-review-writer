@@ -18,6 +18,9 @@ data/*.db
 data/*.sqlite
 data/*.sqlite3
 
+# Downloaded paper PDFs (regenerable, not source)
+data/pdfs/
+
 # Temporary files
 *.tmp
 *.log
