@@ -11,10 +11,13 @@ import hashlib
 import json
 import os
 import re
+import subprocess
+import sys
 import xml.etree.ElementTree as ET
 import pymupdf
 import httpx
 import litellm
+from bs4 import BeautifulSoup
 
 from config import (
     ARXIV_API_URL,
@@ -27,14 +30,18 @@ from config import (
     TAVILY_API_KEY,
     PAPERS_DIR,
     MAX_PDF_DOWNLOAD_BYTES,
-    PAGE_RENDER_DPI,
-    VLM_PAGES_PER_CALL,
     ANALYSIS_MODEL_NAME,
+    VLM_MODEL_NAME,
     NVIDIA_NIM_API_KEY,
     NVIDIA_NIM_API_BASE,
+    TABLE_CROP_DPI,
+    MARKER_TIMEOUT_SECONDS,
 )
 
-from prompts import VLM_PAGE_ANALYSIS_PROMPT
+from prompts import (
+    PAPER_LEVEL_ANALYSIS_PROMPT,
+    IMAGE_DESCRIPTION_PROMPT,
+)
 
 from schemas import (
     AcademicSource,
@@ -1744,137 +1751,356 @@ async def download_pdf(
     }
 
 
-def render_pdf_pages(pdf_path: str) -> dict:
+# ============================================================
+# PAPER CONTENT EXTRACTION (Marker + PyMuPDF)
+# ============================================================
+#
+# Prepares a downloaded PDF for vision-grounded analysis by
+# extracting the paper's real text (exact, via Marker - a local
+# ML-based PDF-to-structure tool, not the VLM) and only sending the
+# VLM small cropped images for the things that genuinely need visual
+# interpretation - figures and tables - each positioned in the
+# original reading order. Marker's own table->markdown conversion was
+# found unreliable on complex scientific tables (confirmed by hand on
+# a real paper), so tables are cropped as images from the original
+# PDF via PyMuPDF instead of trusting Marker's table text.
+#
+# This replaced an earlier full-page-rendering approach
+# (render every page whole, send full pages to the VLM) that was
+# measured far too slow in practice (10+ minutes for a 2-page batch)
+# to be usable.
+
+
+def html_block_to_text(html: str | None) -> str:
     """
-    Render every page of a downloaded research-paper PDF as a
-    complete page image, for vision-language-model analysis.
+    Convert one Marker block's HTML fragment to plain text.
 
-    This intentionally renders whole pages (text, figures, tables,
-    equations, layout, captions - everything as the VLM will see
-    it) rather than extracting text/tables/images separately. There
-    is no OCR/text-extraction pipeline here by design.
+    Marker's per-block HTML is simple (e.g. a single wrapped <p>),
+    so this only needs to strip tags, not handle arbitrary markup.
+    """
 
-    Pages are written next to the PDF, in a "pages" subfolder of
-    the PDF's own directory:
+    if not html:
+        return ""
 
-        <pdf_path's directory>/pages/page_0001.png
-        <pdf_path's directory>/pages/page_0002.png
+    return BeautifulSoup(html, "html.parser").get_text(separator=" ", strip=True)
+
+
+def crop_table_region(
+    pdf_document: pymupdf.Document,
+    page_index: int,
+    bbox: list[float],
+    dpi: int,
+) -> bytes:
+    """
+    Render just one table's bounding box (as reported by Marker, in
+    PDF point space) from the ORIGINAL pdf_document as a PNG.
+
+    Cropping from the original PDF - not from Marker's own output -
+    keeps this independent of whatever Marker did with the table
+    content itself.
+    """
+
+    page = pdf_document[page_index]
+    zoom = dpi / 72.0
+    render_matrix = pymupdf.Matrix(zoom, zoom)
+    clip_rect = pymupdf.Rect(*bbox)
+    pixmap = page.get_pixmap(matrix=render_matrix, clip=clip_rect)
+    return pixmap.tobytes("png")
+
+
+def walk_marker_block(
+    node: dict,
+    page_index: int,
+    pdf_document: pymupdf.Document,
+    segments_dir: str,
+    segments: list[dict],
+    image_counter: dict[str, int],
+) -> None:
+    """
+    Recursively walk one Marker block (and its children, if any) in
+    document order, appending text/image segments to `segments`.
+
+    Table and Diagram/Picture/Figure blocks are treated as leaves
+    (their own children, if any, are not walked into) since their
+    content is fully replaced by a single cropped image. Every other
+    block with children (section groups, list groups, etc.) is
+    walked into; every other leaf block contributes its text, if any
+    - headers/footers are dropped since they carry no analytical
+    content (running page headers/footers, not real content).
+    """
+
+    block_type = node.get("block_type")
+
+    if block_type in ("PageHeader", "PageFooter"):
+        return
+
+    if block_type == "Table":
+        image_counter["table"] += 1
+        image_bytes = crop_table_region(
+            pdf_document, page_index, node["bbox"], TABLE_CROP_DPI
+        )
+        image_path = os.path.join(
+            segments_dir, f"table_{image_counter['table']:04d}.png"
+        )
+        with open(image_path, "wb") as image_file:
+            image_file.write(image_bytes)
+
+        segments.append(
+            {
+                "type": "image",
+                "role": "table",
+                "page_index": page_index,
+                "image_path": image_path,
+            }
+        )
+        return
+
+    if block_type in ("Diagram", "Picture", "Figure"):
+        images = node.get("images") or {}
+        own_image_b64 = images.get(node.get("id"))
+
+        if own_image_b64:
+            image_counter["figure"] += 1
+            image_path = os.path.join(
+                segments_dir, f"figure_{image_counter['figure']:04d}.png"
+            )
+            with open(image_path, "wb") as image_file:
+                image_file.write(base64.b64decode(own_image_b64))
+
+            segments.append(
+                {
+                    "type": "image",
+                    "role": "figure",
+                    "page_index": page_index,
+                    "image_path": image_path,
+                }
+            )
+        return
+
+    children = node.get("children")
+
+    if children:
+        for child in children:
+            walk_marker_block(
+                child, page_index, pdf_document, segments_dir, segments, image_counter
+            )
+        return
+
+    text = html_block_to_text(node.get("html"))
+
+    if text:
+        segments.append(
+            {
+                "type": "text",
+                "role": block_type,
+                "page_index": page_index,
+                "text": text,
+            }
+        )
+
+
+def extract_paper_segments(pdf_path: str) -> dict:
+    """
+    Extract a paper's content as an ordered sequence of text/table-
+    image/figure-image segments, in original reading order, for
+    vision-language-model analysis.
+
+    Runs Marker (a local PDF-to-structure tool) to get exact text
+    and figure crops, then crops table regions from the original PDF
+    via PyMuPDF (see module docstring above for why). Returns file
+    paths for every image segment - never raw image bytes - so the
+    calling agent's own turn only ever sees lightweight metadata,
+    matching describe_image_with_vlm()/analyze_paper_with_vlm()'s
+    own reasoning below (the vision call itself happens inside a
+    tool, never inline in the agent's own turn).
+
+    Writes into a "segments" subfolder next to the PDF:
+
+        <pdf_path's directory>/segments/table_0001.png
+        <pdf_path's directory>/segments/figure_0001.png
         ...
 
-    Since download_pdf() writes each PDF to
-    PAPERS_DIR/<paper_id>/<paper_id>.pdf, this naturally produces:
-
-        PAPERS_DIR/<paper_id>/pages/page_0001.png
-
-    Rendered at PAGE_RENDER_DPI (see config.py).
+    and Marker's own raw output into an "extraction" subfolder.
     """
 
     if not os.path.isfile(pdf_path):
         return {
             "pdf_path": pdf_path,
-            "pages_dir": None,
-            "page_image_paths": [],
-            "page_count": 0,
+            "segments": [],
+            "segment_count": 0,
             "success": False,
             "error": f"No PDF file found at: {pdf_path}",
         }
 
     paper_dir = os.path.dirname(pdf_path)
-    pages_dir = os.path.join(paper_dir, "pages")
+    extraction_dir = os.path.join(paper_dir, "extraction")
+    segments_dir = os.path.join(paper_dir, "segments")
+
+    marker_executable = os.path.join(
+        os.path.dirname(sys.executable),
+        "marker_single.exe" if os.name == "nt" else "marker_single",
+    )
 
     try:
-        document = pymupdf.open(pdf_path)
+        result = subprocess.run(
+            [
+                marker_executable,
+                "--output_dir",
+                extraction_dir,
+                "--output_format",
+                "json",
+                pdf_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=MARKER_TIMEOUT_SECONDS,
+        )
+
+    except FileNotFoundError:
+        return {
+            "pdf_path": pdf_path,
+            "segments": [],
+            "segment_count": 0,
+            "success": False,
+            "error": f"marker_single executable not found at: {marker_executable}",
+        }
+
+    except subprocess.TimeoutExpired:
+        return {
+            "pdf_path": pdf_path,
+            "segments": [],
+            "segment_count": 0,
+            "success": False,
+            "error": f"Marker extraction exceeded {MARKER_TIMEOUT_SECONDS}s.",
+        }
+
+    if result.returncode != 0:
+        return {
+            "pdf_path": pdf_path,
+            "segments": [],
+            "segment_count": 0,
+            "success": False,
+            "error": f"Marker extraction failed: {result.stderr[-500:]}",
+        }
+
+    base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+    json_path = os.path.join(extraction_dir, base_name, f"{base_name}.json")
+
+    if not os.path.isfile(json_path):
+        return {
+            "pdf_path": pdf_path,
+            "segments": [],
+            "segment_count": 0,
+            "success": False,
+            "error": f"Marker did not produce the expected output: {json_path}",
+        }
+
+    try:
+        with open(json_path, encoding="utf-8") as json_file:
+            document_tree = json.load(json_file)
+
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "pdf_path": pdf_path,
+            "segments": [],
+            "segment_count": 0,
+            "success": False,
+            "error": f"Failed to read Marker's output: {exc}",
+        }
+
+    try:
+        pdf_document = pymupdf.open(pdf_path)
 
     except Exception as exc:
         return {
             "pdf_path": pdf_path,
-            "pages_dir": None,
-            "page_image_paths": [],
-            "page_count": 0,
+            "segments": [],
+            "segment_count": 0,
             "success": False,
-            "error": f"Failed to open PDF: {exc}",
+            "error": f"Failed to open PDF for table cropping: {exc}",
         }
 
-    os.makedirs(pages_dir, exist_ok=True)
+    os.makedirs(segments_dir, exist_ok=True)
 
-    # 72 is PDF's native points-per-inch; fitz's zoom factor is
-    # relative to that, so this converts a target DPI into the
-    # zoom matrix PyMuPDF expects.
-    zoom = PAGE_RENDER_DPI / 72.0
-    render_matrix = pymupdf.Matrix(zoom, zoom)
-
-    page_image_paths = []
+    segments: list[dict] = []
+    image_counter = {"table": 0, "figure": 0}
 
     try:
-        for page_index, page in enumerate(document):
-
-            pixmap = page.get_pixmap(matrix=render_matrix)
-
-            image_path = os.path.join(
-                pages_dir,
-                f"page_{page_index + 1:04d}.png",
+        for page_index, page_node in enumerate(document_tree.get("children") or []):
+            walk_marker_block(
+                page_node, page_index, pdf_document, segments_dir, segments, image_counter
             )
 
-            pixmap.save(image_path)
-            page_image_paths.append(image_path)
-
     finally:
-        document.close()
+        pdf_document.close()
 
     return {
         "pdf_path": pdf_path,
-        "pages_dir": pages_dir,
-        "page_image_paths": page_image_paths,
-        "page_count": len(page_image_paths),
+        "segments": segments,
+        "segment_count": len(segments),
+        "text_segment_count": sum(1 for s in segments if s["type"] == "text"),
+        "table_count": image_counter["table"],
+        "figure_count": image_counter["figure"],
         "success": True,
         "error": None,
     }
 
 
-def parse_page_number_from_image_path(image_path: str) -> int | None:
+def build_vlm_message_content(segments: list[dict]) -> list[dict]:
     """
-    Extract the 1-based page number from a rendered page image's
-    filename, e.g. ".../pages/page_0001.png" -> 1.
-
-    Matches the naming convention render_pdf_pages() writes
-    (page_{n:04d}.png). The page number is taken from the filename,
-    never from the VLM's own response, so a page can never be
-    mislabeled even if the model's output is imperfect.
-    """
-
-    match = re.search(r"page_(\d+)\.png$", os.path.basename(image_path))
-
-    if not match:
-        return None
-
-    return int(match.group(1))
-
-
-def is_retryable_vlm_error(exc: Exception) -> bool:
-    """
-    True only for transient failures worth retrying once: a request
-    timeout, or a 5xx from the provider's own gateway. Never retries
-    on anything else (bad request, auth failure, malformed input,
-    etc.) - those will not succeed on a second attempt.
+    Turn extract_paper_segments()'s ordered segment list into one
+    chat-message content list: consecutive text segments are merged
+    into single text parts (so the model reads flowing prose, not
+    hundreds of tiny fragments), and each image segment becomes a
+    small text label (what it is, which page) immediately followed
+    by the actual image - all in original reading order.
     """
 
-    if isinstance(exc, litellm.Timeout):
-        return True
+    content: list[dict] = []
+    text_buffer: list[str] = []
 
-    status_code = getattr(exc, "status_code", None)
-    return status_code is not None and 500 <= status_code < 600
+    def flush_text_buffer() -> None:
+        if text_buffer:
+            content.append({"type": "text", "text": "\n\n".join(text_buffer)})
+            text_buffer.clear()
+
+    for segment in segments:
+
+        if segment["type"] == "text":
+            prefix = "## " if segment["role"] == "SectionHeader" else ""
+            text_buffer.append(prefix + segment["text"])
+            continue
+
+        flush_text_buffer()
+
+        content.append(
+            {
+                "type": "text",
+                "text": f"[{segment['role'].upper()} from page {segment['page_index'] + 1}]",
+            }
+        )
+
+        with open(segment["image_path"], "rb") as image_file:
+            encoded_image = base64.b64encode(image_file.read()).decode("ascii")
+
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{encoded_image}"},
+            }
+        )
+
+    flush_text_buffer()
+    return content
 
 
-def parse_vlm_json_array(raw_output: str | None) -> list[dict] | None:
+def parse_vlm_json_object(raw_output: str | None) -> dict | None:
     """
-    Parse the VLM's raw text response into a JSON array of per-page
-    objects.
+    Parse the VLM's raw text response into a single JSON object.
 
-    VLM_PAGE_ANALYSIS_PROMPT instructs the model to return only a
-    JSON array, but some models wrap output in markdown code fences
-    anyway, so those are stripped before parsing. Returns None
-    (never a guess/fabricated structure) if the result isn't valid
-    JSON or isn't a list.
+    Tolerates markdown code-fence wrapping some models add anyway.
+    Returns None (never a guess) if the result isn't valid JSON or
+    isn't an object.
     """
 
     if not raw_output:
@@ -1894,186 +2120,250 @@ def parse_vlm_json_array(raw_output: str | None) -> list[dict] | None:
     except json.JSONDecodeError:
         return None
 
-    if not isinstance(parsed, list):
+    if not isinstance(parsed, dict):
         return None
 
     return parsed
 
 
-async def analyze_pages_with_vlm(
-    paper_id: str,
-    page_image_paths: list[str],
-) -> dict:
+async def describe_image_with_vlm(image_path: str) -> dict:
     """
-    Vision-analyze already-rendered PDF page images for one paper
-    using the vision-language model, and return a structured
-    PageAnalysis per page.
+    Describe one cropped table/figure image with a single VLM call.
 
-    Pages are sent VLM_PAGES_PER_CALL at a time, as separate
-    full-resolution images within a single model call (never
-    composited into one image), reducing the number of VLM requests
-    without shrinking any individual page's resolution.
-
-    This performs the vision inference directly (via the same model
-    configured as ANALYSIS_MODEL) rather than relying on the calling
-    agent's own conversation turn to see the images: the chat-completions
-    protocol only allows images inside user-role message content, never
-    inside a tool/function result, so a tool returning raw image bytes
-    could not be "seen" by the agent's own turn anyway.
-
-    A batch that fails (transport error, malformed JSON, wrong number
-    of objects returned) is reported as a structured failure for
-    exactly the pages in that batch - it never invents PageAnalysis
-    content - and does not prevent other batches for the same paper
-    from succeeding.
+    NVIDIA NIM's hosted VLM_MODEL_NAME endpoint enforces at most one
+    image per request (confirmed by hand: a multi-image request
+    against it fails with "At most 1 image(s) may be provided in one
+    prompt"), so a paper's images cannot be sent together in one
+    call to this model - each is described individually here, and
+    analyze_paper_with_vlm() below assembles those descriptions back
+    into the document as text before the actual paper-level
+    synthesis call.
     """
 
-    page_analyses: list[dict] = []
-    failed_pages: list[dict] = []
+    try:
+        with open(image_path, "rb") as image_file:
+            encoded_image = base64.b64encode(image_file.read()).decode("ascii")
 
-    batches = [
-        page_image_paths[i:i + VLM_PAGES_PER_CALL]
-        for i in range(0, len(page_image_paths), VLM_PAGES_PER_CALL)
-    ]
+    except Exception as exc:
+        return {
+            "description": None,
+            "success": False,
+            "error": f"Failed to read image: {exc}",
+        }
 
-    for batch in batches:
+    raw_output = None
+    call_error = None
 
-        batch_page_numbers = [
-            parse_page_number_from_image_path(image_path)
-            for image_path in batch
-        ]
-
+    for attempt in range(2):
         try:
-            message_content = [
-                {
-                    "type": "text",
-                    "text": f"Analyze the following {len(batch)} page(s), in order.",
-                }
-            ]
-
-            for image_path in batch:
-                with open(image_path, "rb") as image_file:
-                    encoded_image = base64.b64encode(
-                        image_file.read()
-                    ).decode("ascii")
-
-                message_content.append(
+            response = await litellm.acompletion(
+                model=f"nvidia_nim/{VLM_MODEL_NAME}",
+                api_key=NVIDIA_NIM_API_KEY,
+                api_base=NVIDIA_NIM_API_BASE,
+                messages=[
+                    {"role": "system", "content": IMAGE_DESCRIPTION_PROMPT},
                     {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{encoded_image}"
-                        },
-                    }
-                )
-
-            raw_output = None
-            call_error = None
-
-            # One retry, and only for a transient timeout/5xx - not
-            # for errors that would fail again identically (bad
-            # request, auth, etc).
-            for attempt in range(2):
-                try:
-                    response = await litellm.acompletion(
-                        model=f"nvidia_nim/{ANALYSIS_MODEL_NAME}",
-                        api_key=NVIDIA_NIM_API_KEY,
-                        api_base=NVIDIA_NIM_API_BASE,
-                        messages=[
-                            {"role": "system", "content": VLM_PAGE_ANALYSIS_PROMPT},
-                            {"role": "user", "content": message_content},
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{encoded_image}"
+                                },
+                            }
                         ],
-                    )
-                    raw_output = response.choices[0].message.content
-                    call_error = None
-                    break
-
-                except Exception as exc:
-                    call_error = exc
-                    if attempt == 0 and is_retryable_vlm_error(exc):
-                        continue
-                    break
-
-            if call_error is not None:
-                raise call_error
+                    },
+                ],
+            )
+            raw_output = response.choices[0].message.content
+            call_error = None
+            break
 
         except Exception as exc:
-            for image_path, page_number in zip(batch, batch_page_numbers):
-                failed_pages.append(
-                    {
-                        "paper_id": paper_id,
-                        "page_number": page_number,
-                        "image_path": image_path,
-                        "error": f"VLM request failed: {exc}",
-                    }
-                )
+            call_error = exc
+            if attempt == 0 and is_retryable_vlm_error(exc):
+                continue
+            break
+
+    if call_error is not None:
+        return {
+            "description": None,
+            "success": False,
+            "error": f"VLM request failed: {call_error}",
+        }
+
+    if not raw_output or not raw_output.strip():
+        return {
+            "description": None,
+            "success": False,
+            "error": "VLM returned an empty description.",
+        }
+
+    return {"description": raw_output.strip(), "success": True, "error": None}
+
+
+async def expand_image_segments_to_text(segments: list[dict]) -> tuple[list[dict], list[dict]]:
+    """
+    Replace every image segment (table/figure crop) with a text
+    segment carrying that image's VLM-generated description,
+    preserving original order and page_index/role.
+
+    Descriptions are generated one image at a time (see
+    describe_image_with_vlm's docstring for why). A segment whose
+    description fails is dropped from the returned sequence - never
+    replaced with a fabricated description - and reported in the
+    second return value so the caller can see what was lost.
+    """
+
+    expanded: list[dict] = []
+    failed: list[dict] = []
+
+    for segment in segments:
+
+        if segment["type"] != "image":
+            expanded.append(segment)
             continue
 
-        parsed_pages = parse_vlm_json_array(raw_output)
+        result = await describe_image_with_vlm(segment["image_path"])
 
-        if parsed_pages is None or len(parsed_pages) != len(batch):
-            for image_path, page_number in zip(batch, batch_page_numbers):
-                failed_pages.append(
-                    {
-                        "paper_id": paper_id,
-                        "page_number": page_number,
-                        "image_path": image_path,
-                        "error": (
-                            "VLM response was not a JSON array with "
-                            f"one object per page (expected {len(batch)})."
-                        ),
-                    }
-                )
+        if not result["success"]:
+            failed.append(
+                {
+                    "role": segment["role"],
+                    "page_index": segment["page_index"],
+                    "image_path": segment["image_path"],
+                    "error": result["error"],
+                }
+            )
             continue
 
-        for image_path, page_number, page_data in zip(
-            batch, batch_page_numbers, parsed_pages
-        ):
+        expanded.append(
+            {
+                "type": "text",
+                "role": segment["role"],
+                "page_index": segment["page_index"],
+                "text": result["description"],
+            }
+        )
 
-            if page_number is None:
-                failed_pages.append(
-                    {
-                        "paper_id": paper_id,
-                        "page_number": None,
-                        "image_path": image_path,
-                        "error": (
-                            "Could not determine page number from "
-                            f"image filename: {image_path}"
-                        ),
-                    }
-                )
+    return expanded, failed
+
+
+async def analyze_paper_with_vlm(paper_id: str, segments: list[dict]) -> dict:
+    """
+    Analyze an entire paper and return a validated PaperAnalysis,
+    using extract_paper_segments()'s ordered text/table-image/
+    figure-image sequence.
+
+    Two-phase, because the available vision model only accepts one
+    image per request (see describe_image_with_vlm):
+
+    1. Every table/figure image is described individually by the
+       vision model (VLM_MODEL_NAME) and substituted into the
+       document as text, in place.
+    2. The now-fully-textual document (exact extracted text +
+       VLM-generated image descriptions, in original reading order)
+       is sent as ONE call to the reasoning model (ANALYSIS_MODEL_NAME
+       - no vision needed at this point) to produce the paper-level
+       synthesis, which is then validated via build_paper_analysis().
+
+    This still means every table/figure was actually looked at by a
+    vision model (grounded, not guessed from surrounding text) - it
+    just happens as a preceding step rather than inside the final
+    synthesis call.
+
+    page_analyses is left empty in the returned PaperAnalysis - there
+    is no per-page result in this pipeline; page-level provenance is
+    each segment's page_index/role, not a PageAnalysis object.
+    """
+
+    text_segments, failed_images = await expand_image_segments_to_text(segments)
+
+    try:
+        message_content = build_vlm_message_content(text_segments)
+
+    except Exception as exc:
+        return {
+            "paper_id": paper_id,
+            "paper_analysis": None,
+            "success": False,
+            "error": f"Failed to assemble synthesis message from segments: {exc}",
+        }
+
+    raw_output = None
+    call_error = None
+
+    for attempt in range(2):
+        try:
+            response = await litellm.acompletion(
+                model=f"nvidia_nim/{ANALYSIS_MODEL_NAME}",
+                api_key=NVIDIA_NIM_API_KEY,
+                api_base=NVIDIA_NIM_API_BASE,
+                messages=[
+                    {"role": "system", "content": PAPER_LEVEL_ANALYSIS_PROMPT},
+                    {"role": "user", "content": message_content},
+                ],
+            )
+            raw_output = response.choices[0].message.content
+            call_error = None
+            break
+
+        except Exception as exc:
+            call_error = exc
+            if attempt == 0 and is_retryable_vlm_error(exc):
                 continue
+            break
 
-            try:
-                page_analysis = PageAnalysis.model_validate(
-                    {
-                        "paper_id": paper_id,
-                        "page_number": page_number,
-                        "image_path": image_path,
-                        **page_data,
-                    }
-                )
+    if call_error is not None:
+        return {
+            "paper_id": paper_id,
+            "paper_analysis": None,
+            "success": False,
+            "error": f"Synthesis request failed: {call_error}",
+            "failed_images": failed_images,
+        }
 
-            except Exception as exc:
-                failed_pages.append(
-                    {
-                        "paper_id": paper_id,
-                        "page_number": page_number,
-                        "image_path": image_path,
-                        "error": f"PageAnalysis validation failed: {exc}",
-                    }
-                )
-                continue
+    synthesis = parse_vlm_json_object(raw_output)
 
-            page_analyses.append(page_analysis.model_dump(mode="json"))
+    if synthesis is None:
+        return {
+            "paper_id": paper_id,
+            "paper_analysis": None,
+            "success": False,
+            "error": "Synthesis response was not a valid JSON object.",
+            "failed_images": failed_images,
+        }
 
-    return {
-        "paper_id": paper_id,
-        "requested_page_count": len(page_image_paths),
-        "analyzed_page_count": len(page_analyses),
-        "page_analyses": page_analyses,
-        "failed_pages": failed_pages,
-        "success": len(failed_pages) < len(page_image_paths),
-    }
+    result = build_paper_analysis(
+        paper_id=paper_id,
+        page_analyses=[],
+        research_objective=synthesis.get("research_objective"),
+        methodology=synthesis.get("methodology"),
+        datasets=synthesis.get("datasets"),
+        experimental_setup=synthesis.get("experimental_setup"),
+        metrics=synthesis.get("metrics"),
+        key_findings=synthesis.get("key_findings"),
+        contributions=synthesis.get("contributions"),
+        limitations=synthesis.get("limitations"),
+        future_work=synthesis.get("future_work"),
+    )
+    result["failed_images"] = failed_images
+    return result
+
+
+def is_retryable_vlm_error(exc: Exception) -> bool:
+    """
+    True only for transient failures worth retrying once: a request
+    timeout, or a 5xx from the provider's own gateway. Never retries
+    on anything else (bad request, auth failure, malformed input,
+    etc.) - those will not succeed on a second attempt.
+    """
+
+    if isinstance(exc, litellm.Timeout):
+        return True
+
+    status_code = getattr(exc, "status_code", None)
+    return status_code is not None and 500 <= status_code < 600
 
 
 def build_paper_analysis(

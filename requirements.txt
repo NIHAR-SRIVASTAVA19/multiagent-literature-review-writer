@@ -4,3 +4,5 @@ dotenv
 litellm
 aiosqlite
 pymupdf
+marker-pdf
+beautifulsoup4

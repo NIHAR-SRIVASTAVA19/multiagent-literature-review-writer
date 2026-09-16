@@ -74,25 +74,23 @@ MAX_PDF_DOWNLOAD_BYTES = int(
     )
 )
 
-# Resolution used when rendering PDF pages to images for the VLM.
-# 150 DPI keeps normal text/figures/tables legible without producing
-# unreasonably large image files.
-PAGE_RENDER_DPI = int(
+# Resolution used when cropping table regions out of the original PDF
+# (extract_paper_segments()). Marker's own table->markdown conversion
+# is unreliable on complex scientific tables, so tables are cropped
+# as images and sent to the VLM directly instead.
+TABLE_CROP_DPI = int(
     os.getenv(
-        "PAGE_RENDER_DPI",
+        "TABLE_CROP_DPI",
         "150",
     )
 )
 
-# Number of rendered page images sent to the vision-language model in a
-# single call. Batching multiple pages per call (instead of one call per
-# page) reduces the number of VLM requests; the images stay at full
-# resolution (this does not composite pages into one image - see
-# analyze_pages_with_vlm() in tools.py).
-VLM_PAGES_PER_CALL = int(
+# Max time allowed for a single marker_single subprocess call
+# (extract_paper_segments()).
+MARKER_TIMEOUT_SECONDS = int(
     os.getenv(
-        "VLM_PAGES_PER_CALL",
-        "4",
+        "MARKER_TIMEOUT_SECONDS",
+        "300",
     )
 )
 
@@ -164,10 +162,26 @@ SEARCH_MODEL = nvidia_model(
 
 ANALYSIS_MODEL_NAME = os.getenv(
     "ANALYSIS_MODEL",
-    "moonshotai/kimi-k3",
+    # Reasoning/orchestration only (tool calls, judgment) - matches
+    # the same workhorse reasoning model used elsewhere (Root, Search
+    # Coordinator, Validator). Vision calls use VLM_MODEL_NAME below,
+    # not this - kimi-k3's hosted vision endpoint was measured at
+    # 7+ minutes for a single request (still not returned when
+    # aborted); llama-3.2-11b-vision-instruct returned an accurate
+    # answer in ~15s on the same infrastructure.
+    "nvidia/nemotron-3.5-lightning-30b-a3b",
 )
 
 ANALYSIS_MODEL = nvidia_model(ANALYSIS_MODEL_NAME)
+
+# Dedicated vision-language model for describe_image_with_vlm() in
+# tools.py - deliberately separate from ANALYSIS_MODEL_NAME (see
+# note above). No ADK Agent uses this directly; it's passed straight
+# into litellm.acompletion() by the vision tools themselves.
+VLM_MODEL_NAME = os.getenv(
+    "VLM_MODEL",
+    "meta/llama-3.2-11b-vision-instruct",
+)
 
 
 SYNTHESIZER_MODEL = nvidia_model(

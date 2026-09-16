@@ -8,9 +8,8 @@ from tools import (
     rerank_papers,
     select_papers,
     download_pdf,
-    render_pdf_pages,
-    analyze_pages_with_vlm,
-    build_paper_analysis,
+    extract_paper_segments,
+    analyze_paper_with_vlm,
 )
 
 load_dotenv()
@@ -34,8 +33,7 @@ analysis_agent = Agent(
         rerank_papers,
         select_papers,
         download_pdf,
-        render_pdf_pages,
-        analyze_pages_with_vlm,
-        build_paper_analysis,
+        extract_paper_segments,
+        analyze_paper_with_vlm,
     ],
 )
