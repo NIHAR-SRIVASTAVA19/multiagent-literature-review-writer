@@ -3,6 +3,8 @@ from dotenv import load_dotenv
 from config import CONTENT_REVIEWER_MODEL
 from prompts import CONTENT_REVIEWER_PROMPT
 
+from tools import build_content_review_result
+
 load_dotenv()
 
 
@@ -19,5 +21,7 @@ content_reviewer = Agent(
 
     instruction=CONTENT_REVIEWER_PROMPT,
 
-    tools=[],
+    tools=[
+        build_content_review_result,
+    ],
 )

@@ -10,6 +10,7 @@ from tools import (
     download_pdf,
     extract_paper_segments,
     analyze_paper_with_vlm,
+    build_evidence,
 )
 
 load_dotenv()
@@ -35,5 +36,6 @@ analysis_agent = Agent(
         download_pdf,
         extract_paper_segments,
         analyze_paper_with_vlm,
+        build_evidence,
     ],
 )

@@ -1,7 +1,9 @@
 pydantic
-google-adk
+google-adk[db]
+greenlet
 dotenv
 litellm
+pillow
 aiosqlite
 pymupdf
 marker-pdf

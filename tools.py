@@ -6,6 +6,7 @@ These functions are currently placeholders.
 Actual API integrations and processing logic will be implemented
 after the agent architecture has been defined.
 """
+import asyncio
 import base64
 import hashlib
 import json
@@ -36,6 +37,8 @@ from config import (
     NVIDIA_NIM_API_BASE,
     TABLE_CROP_DPI,
     MARKER_TIMEOUT_SECONDS,
+    VLM_CONCURRENCY,
+    VLM_REQUEST_TIMEOUT_SECONDS,
 )
 
 from prompts import (
@@ -51,6 +54,10 @@ from schemas import (
     WebSource,
     PageAnalysis,
     PaperAnalysis,
+    Synthesis,
+    LiteratureReviewDraft,
+    ContentReviewResult,
+    CitationReviewResult,
 )
 
 # ============================================================
@@ -1785,6 +1792,26 @@ def html_block_to_text(html: str | None) -> str:
     return BeautifulSoup(html, "html.parser").get_text(separator=" ", strip=True)
 
 
+def detect_image_mime_type(image_bytes: bytes) -> str:
+    """
+    Sniff an image's real encoding from its magic bytes rather than
+    assuming PNG. Marker's own figure/diagram crops (returned as
+    base64 in its JSON output) are not guaranteed to be PNG even
+    though the PyMuPDF-cropped table images always are - confirmed by
+    hand on a real paper, where every figure crop was actually JPEG.
+    Sending a mismatched Content-Type to the VLM for an image that is
+    actually JPEG risks the request being rejected or misread.
+    """
+
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+
+    return "image/png"
+
+
 def crop_table_region(
     pdf_document: pymupdf.Document,
     page_index: int,
@@ -1860,12 +1887,18 @@ def walk_marker_block(
         own_image_b64 = images.get(node.get("id"))
 
         if own_image_b64:
+            image_bytes = base64.b64decode(own_image_b64)
+            extension = (
+                ".jpg"
+                if detect_image_mime_type(image_bytes) == "image/jpeg"
+                else ".png"
+            )
             image_counter["figure"] += 1
             image_path = os.path.join(
-                segments_dir, f"figure_{image_counter['figure']:04d}.png"
+                segments_dir, f"figure_{image_counter['figure']:04d}{extension}"
             )
             with open(image_path, "wb") as image_file:
-                image_file.write(base64.b64decode(own_image_b64))
+                image_file.write(image_bytes)
 
             segments.append(
                 {
@@ -2081,12 +2114,15 @@ def build_vlm_message_content(segments: list[dict]) -> list[dict]:
         )
 
         with open(segment["image_path"], "rb") as image_file:
-            encoded_image = base64.b64encode(image_file.read()).decode("ascii")
+            raw_image_bytes = image_file.read()
+
+        mime_type = detect_image_mime_type(raw_image_bytes)
+        encoded_image = base64.b64encode(raw_image_bytes).decode("ascii")
 
         content.append(
             {
                 "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{encoded_image}"},
+                "image_url": {"url": f"data:{mime_type};base64,{encoded_image}"},
             }
         )
 
@@ -2142,7 +2178,10 @@ async def describe_image_with_vlm(image_path: str) -> dict:
 
     try:
         with open(image_path, "rb") as image_file:
-            encoded_image = base64.b64encode(image_file.read()).decode("ascii")
+            raw_image_bytes = image_file.read()
+
+        mime_type = detect_image_mime_type(raw_image_bytes)
+        encoded_image = base64.b64encode(raw_image_bytes).decode("ascii")
 
     except Exception as exc:
         return {
@@ -2160,6 +2199,7 @@ async def describe_image_with_vlm(image_path: str) -> dict:
                 model=f"nvidia_nim/{VLM_MODEL_NAME}",
                 api_key=NVIDIA_NIM_API_KEY,
                 api_base=NVIDIA_NIM_API_BASE,
+                timeout=VLM_REQUEST_TIMEOUT_SECONDS,
                 messages=[
                     {"role": "system", "content": IMAGE_DESCRIPTION_PROMPT},
                     {
@@ -2168,7 +2208,7 @@ async def describe_image_with_vlm(image_path: str) -> dict:
                             {
                                 "type": "image_url",
                                 "image_url": {
-                                    "url": f"data:image/png;base64,{encoded_image}"
+                                    "url": f"data:{mime_type};base64,{encoded_image}"
                                 },
                             }
                         ],
@@ -2208,23 +2248,44 @@ async def expand_image_segments_to_text(segments: list[dict]) -> tuple[list[dict
     segment carrying that image's VLM-generated description,
     preserving original order and page_index/role.
 
-    Descriptions are generated one image at a time (see
-    describe_image_with_vlm's docstring for why). A segment whose
+    Each image's description is an independent VLM call, so all of a
+    paper's images are described concurrently (bounded by
+    VLM_CONCURRENCY, so a paper with many images doesn't burst an
+    unbounded number of requests at once) instead of one at a time -
+    this is the main cost in analyze_paper_with_vlm()'s runtime.
+    Results are placed back by each image's original position in
+    `segments`, never by completion order, so document order is
+    unaffected by which call happens to finish first. A segment whose
     description fails is dropped from the returned sequence - never
     replaced with a fabricated description - and reported in the
     second return value so the caller can see what was lost.
     """
 
+    semaphore = asyncio.Semaphore(VLM_CONCURRENCY)
+
+    async def describe_with_limit(image_path: str) -> dict:
+        async with semaphore:
+            return await describe_image_with_vlm(image_path)
+
+    image_indices = [
+        index for index, segment in enumerate(segments) if segment["type"] == "image"
+    ]
+
+    results = await asyncio.gather(
+        *(describe_with_limit(segments[index]["image_path"]) for index in image_indices)
+    )
+    result_by_index = dict(zip(image_indices, results))
+
     expanded: list[dict] = []
     failed: list[dict] = []
 
-    for segment in segments:
+    for index, segment in enumerate(segments):
 
         if segment["type"] != "image":
             expanded.append(segment)
             continue
 
-        result = await describe_image_with_vlm(segment["image_path"])
+        result = result_by_index[index]
 
         if not result["success"]:
             failed.append(
@@ -2275,6 +2336,14 @@ async def analyze_paper_with_vlm(paper_id: str, segments: list[dict]) -> dict:
     page_analyses is left empty in the returned PaperAnalysis - there
     is no per-page result in this pipeline; page-level provenance is
     each segment's page_index/role, not a PageAnalysis object.
+
+    The returned "segments" field is this same grounded document (real
+    extracted text + real VLM-generated image descriptions, in
+    original reading order, each tagged page_index/role) that was
+    actually sent to the synthesis call - returned alongside
+    paper_analysis so the caller can cite specific pages (e.g. for
+    Evidence generation) instead of only having the high-level
+    synthesized summary fields to work from.
     """
 
     text_segments, failed_images = await expand_image_segments_to_text(segments)
@@ -2288,6 +2357,8 @@ async def analyze_paper_with_vlm(paper_id: str, segments: list[dict]) -> dict:
             "paper_analysis": None,
             "success": False,
             "error": f"Failed to assemble synthesis message from segments: {exc}",
+            "segments": text_segments,
+            "failed_images": failed_images,
         }
 
     raw_output = None
@@ -2299,6 +2370,7 @@ async def analyze_paper_with_vlm(paper_id: str, segments: list[dict]) -> dict:
                 model=f"nvidia_nim/{ANALYSIS_MODEL_NAME}",
                 api_key=NVIDIA_NIM_API_KEY,
                 api_base=NVIDIA_NIM_API_BASE,
+                timeout=VLM_REQUEST_TIMEOUT_SECONDS,
                 messages=[
                     {"role": "system", "content": PAPER_LEVEL_ANALYSIS_PROMPT},
                     {"role": "user", "content": message_content},
@@ -2320,6 +2392,7 @@ async def analyze_paper_with_vlm(paper_id: str, segments: list[dict]) -> dict:
             "paper_analysis": None,
             "success": False,
             "error": f"Synthesis request failed: {call_error}",
+            "segments": text_segments,
             "failed_images": failed_images,
         }
 
@@ -2331,6 +2404,7 @@ async def analyze_paper_with_vlm(paper_id: str, segments: list[dict]) -> dict:
             "paper_analysis": None,
             "success": False,
             "error": "Synthesis response was not a valid JSON object.",
+            "segments": text_segments,
             "failed_images": failed_images,
         }
 
@@ -2347,6 +2421,7 @@ async def analyze_paper_with_vlm(paper_id: str, segments: list[dict]) -> dict:
         limitations=synthesis.get("limitations"),
         future_work=synthesis.get("future_work"),
     )
+    result["segments"] = text_segments
     result["failed_images"] = failed_images
     return result
 
@@ -2433,19 +2508,444 @@ def build_paper_analysis(
     }
 
 
+def build_evidence(paper_analysis: dict, evidence_items: list[dict]) -> dict:
+    """
+    Attach a list of agent-judged Evidence objects onto an already-
+    built PaperAnalysis (as returned by build_paper_analysis() /
+    analyze_paper_with_vlm()'s "paper_analysis" field).
+
+    Deciding what counts as evidence-worthy - which finding, table,
+    figure, or methodology detail actually matters, why it is
+    relevant to the research question, how confident to be, which
+    pages support it - is the Analysis Agent's own judgment, grounded
+    in the paper's real extracted text/table/figure descriptions
+    (analyze_paper_with_vlm()'s returned "segments", each carrying the
+    page_index that page-cited evidence must be derived from). This
+    function does not do that reasoning.
+
+    What it does do deterministically: assigns every evidence item a
+    unique evidence_id scoped to the paper (e.g. "<paper_id>_evidence_001",
+    in the given order) - never trusting the agent to invent unique
+    IDs across a batch - and forces paper_id to match the given
+    paper_analysis (never trusting an agent-supplied value there
+    either, present or not), then validates the result against the
+    canonical PaperAnalysis schema (which validates each item against
+    Evidence in the process). Returns a structured validation failure
+    (never a fabricated or partially-coerced PaperAnalysis) if any
+    evidence item doesn't satisfy the schema.
+    """
+
+    paper_id = paper_analysis.get("paper_id")
+
+    numbered_evidence = []
+
+    for index, item in enumerate(evidence_items, start=1):
+        candidate = dict(item)
+        candidate["evidence_id"] = f"{paper_id}_evidence_{index:03d}"
+        candidate["paper_id"] = paper_id
+        numbered_evidence.append(candidate)
+
+    updated_paper_analysis = dict(paper_analysis)
+    updated_paper_analysis["evidence"] = numbered_evidence
+
+    try:
+        validated = PaperAnalysis.model_validate(updated_paper_analysis)
+
+    except Exception as exc:
+        return {
+            "paper_id": paper_id,
+            "paper_analysis": None,
+            "success": False,
+            "error": f"PaperAnalysis validation failed after attaching evidence: {exc}",
+        }
+
+    return {
+        "paper_id": paper_id,
+        "paper_analysis": validated.model_dump(mode="json"),
+        "success": True,
+        "error": None,
+    }
+
+
+# ============================================================
+# SYNTHESIZER TOOLS
+# ============================================================
+
+def build_synthesis(
+    thematic_findings: list[str] | None = None,
+    methodological_comparison: list[str] | None = None,
+    dataset_comparison: list[str] | None = None,
+    metric_comparison: list[str] | None = None,
+    contradictions: list[str] | None = None,
+    common_trends: list[str] | None = None,
+    strengths: list[str] | None = None,
+    weaknesses: list[str] | None = None,
+    research_gaps: list[dict] | None = None,
+    claims: list[dict] | None = None,
+) -> dict:
+    """
+    Assemble and validate the cross-paper Synthesis.
+
+    Working out themes, methodological/dataset/metric comparisons,
+    agreements, contradictions, trends, limitations, research gaps,
+    and supported claims from the analyzed PaperAnalysis/Evidence
+    corpus is the Synthesizer Agent's own cross-paper reasoning - this
+    function does not do that reasoning. It only assigns deterministic,
+    unique IDs to research_gaps/claims (gap_001, gap_002, ...;
+    claim_001, claim_002, ... - in the given order, never trusting the
+    agent to invent unique IDs across a batch, the same reasoning as
+    build_evidence()'s evidence_id) and validates the combined result
+    against the canonical Synthesis schema.
+
+    Returns a structured validation failure (never a fabricated or
+    partially-coerced Synthesis) if the supplied fields don't satisfy
+    the schema.
+    """
+
+    numbered_gaps = []
+    for index, gap in enumerate(research_gaps or [], start=1):
+        candidate = dict(gap)
+        candidate["gap_id"] = f"gap_{index:03d}"
+        numbered_gaps.append(candidate)
+
+    numbered_claims = []
+    for index, claim in enumerate(claims or [], start=1):
+        candidate = dict(claim)
+        candidate["claim_id"] = f"claim_{index:03d}"
+        numbered_claims.append(candidate)
+
+    try:
+        synthesis = Synthesis.model_validate(
+            {
+                "thematic_findings": thematic_findings or [],
+                "methodological_comparison": methodological_comparison or [],
+                "dataset_comparison": dataset_comparison or [],
+                "metric_comparison": metric_comparison or [],
+                "contradictions": contradictions or [],
+                "common_trends": common_trends or [],
+                "strengths": strengths or [],
+                "weaknesses": weaknesses or [],
+                "research_gaps": numbered_gaps,
+                "claims": numbered_claims,
+            }
+        )
+
+    except Exception as exc:
+        return {
+            "synthesis": None,
+            "success": False,
+            "error": f"Synthesis validation failed: {exc}",
+        }
+
+    return {
+        "synthesis": synthesis.model_dump(mode="json"),
+        "success": True,
+        "error": None,
+    }
+
+
+# ============================================================
+# WRITER TOOLS
+# ============================================================
+
+def build_literature_review_draft(
+    title: str,
+    introduction: str,
+    sections: list[dict],
+    conclusion: str,
+    claims: list[dict],
+    citations: list[dict],
+) -> dict:
+    """
+    Assemble and validate the structured LiteratureReviewDraft.
+
+    Organizing the review, writing evidence-grounded academic prose,
+    and deciding which claims/citations support which section is the
+    Writer Agent's own reasoning - this function does not do that
+    reasoning. It only handles deterministic bookkeeping and schema
+    validation:
+
+    - sections: each is assigned a unique section_id (section_001,
+      section_002, ... in the given order) - never trusting the agent
+      to invent unique IDs, the same reasoning as build_evidence()'s
+      evidence_id / build_synthesis()'s gap_id/claim_id.
+    - citations: each is a NEW record (this is where Citation objects
+      first come into existence in the pipeline) built from real
+      PaperMetadata the agent was given - each is assigned a unique
+      citation_id (citation_001, ...) the same way.
+    - claims: these are NOT new - they are the Synthesizer's own
+      already-ID'd Claim objects (claim_001, ...) being carried
+      forward into the draft, so their claim_id is trusted/preserved
+      as-is here. Reassigning it would break the Claim -> Evidence ->
+      Paper -> Page traceability chain the Writer/Validator both rely
+      on. The schema still validates each one is well-formed.
+
+    Returns a structured validation failure (never a fabricated or
+    partially-coerced LiteratureReviewDraft) if the supplied fields
+    don't satisfy the schema.
+    """
+
+    numbered_sections = []
+    for index, section in enumerate(sections, start=1):
+        candidate = dict(section)
+        candidate["section_id"] = f"section_{index:03d}"
+        numbered_sections.append(candidate)
+
+    numbered_citations = []
+    for index, citation in enumerate(citations, start=1):
+        candidate = dict(citation)
+        candidate["citation_id"] = f"citation_{index:03d}"
+        numbered_citations.append(candidate)
+
+    try:
+        draft = LiteratureReviewDraft.model_validate(
+            {
+                "title": title,
+                "introduction": introduction,
+                "sections": numbered_sections,
+                "conclusion": conclusion,
+                "claims": claims,
+                "citations": numbered_citations,
+            }
+        )
+
+    except Exception as exc:
+        return {
+            "draft": None,
+            "success": False,
+            "error": f"LiteratureReviewDraft validation failed: {exc}",
+        }
+
+    return {
+        "draft": draft.model_dump(mode="json"),
+        "success": True,
+        "error": None,
+    }
+
+
+# ============================================================
+# CONTENT REVIEWER TOOLS
+# ============================================================
+
+def build_content_review_result(
+    status: str,
+    issues: list[dict] | None = None,
+    unsupported_claim_ids: list[str] | None = None,
+    missing_coverage: list[str] | None = None,
+    revision_instructions: list[str] | None = None,
+    summary: str | None = None,
+) -> dict:
+    """
+    Assemble and validate the Content Reviewer's structured
+    ContentReviewResult.
+
+    Judging whether the draft is coherent, evidence-grounded,
+    complete, and faithful to the synthesis - and deciding PASS vs
+    REVISE - is the Content Reviewer's own reasoning; this function
+    does not do that judgment. It only assigns each issue a
+    deterministic, unique issue_id (issue_001, issue_002, ... in the
+    given order - never trusting the agent to invent unique IDs, the
+    same reasoning as every other build_*() tool in this pipeline)
+    and validates the combined result against the canonical
+    ContentReviewResult schema.
+
+    Returns a structured validation failure (never a fabricated or
+    partially-coerced ContentReviewResult) if the supplied fields
+    don't satisfy the schema.
+    """
+
+    numbered_issues = []
+
+    for index, issue in enumerate(issues or [], start=1):
+        candidate = dict(issue)
+        candidate["issue_id"] = f"issue_{index:03d}"
+        numbered_issues.append(candidate)
+
+    try:
+        result = ContentReviewResult.model_validate(
+            {
+                "status": status,
+                "issues": numbered_issues,
+                "unsupported_claim_ids": unsupported_claim_ids or [],
+                "missing_coverage": missing_coverage or [],
+                "revision_instructions": revision_instructions or [],
+                "summary": summary,
+            }
+        )
+
+    except Exception as exc:
+        return {
+            "content_review_result": None,
+            "success": False,
+            "error": f"ContentReviewResult validation failed: {exc}",
+        }
+
+    return {
+        "content_review_result": result.model_dump(mode="json"),
+        "success": True,
+        "error": None,
+    }
+
+
 # ============================================================
 # CITATION REVIEWER TOOLS
 # ============================================================
 
-def verify_doi(doi: str) -> dict:
+async def verify_doi(doi: str) -> dict:
     """
-    Verify whether a DOI exists and resolves to a real
-    scholarly work.
+    Verify whether a DOI exists and, if it does, report what it
+    actually resolves to - via Crossref's per-DOI lookup endpoint
+    (the same Crossref API already used by search_crossref()).
+
+    This function only checks existence/resolution. It does NOT judge
+    whether the resolved record matches any particular claimed title
+    - that identity comparison is verify_source_identity()'s job, so
+    the same resolution logic isn't duplicated with different
+    judgment baked in.
+
+    Reports a tri-state outcome so "confirmed does not exist" is
+    never conflated with "could not be checked" - CITATION_REVIEWER_PROMPT
+    explicitly distinguishes VERIFIED/INVALID/UNVERIFIED, and treating
+    a transient tool failure as proof of fabrication would violate
+    "Never treat a search-tool failure as proof that a paper does not
+    exist.":
+
+        exists=True  -> Crossref has a record for this DOI.
+        exists=False -> Crossref returned 404: the DOI does not exist.
+        exists=None  -> could not be determined (malformed DOI, rate
+                         limit, transport failure) - success=False.
     """
-    pass
+
+    normalized_doi = normalize_doi_for_dedup(doi)
+
+    if not normalized_doi:
+        return {
+            "doi": doi,
+            "exists": None,
+            "resolved_title": None,
+            "resolved_authors": [],
+            "resolved_year": None,
+            "resolved_venue": None,
+            "success": False,
+            "error": "No DOI provided.",
+        }
+
+    params = {"mailto": CROSSREF_MAILTO} if CROSSREF_MAILTO else {}
+
+    headers = {
+        "User-Agent": (
+            "MultiAgentResearchSystem/1.0"
+            + (
+                f" (mailto:{CROSSREF_MAILTO})"
+                if CROSSREF_MAILTO
+                else ""
+            )
+        )
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"{CROSSREF_API_URL}/{normalized_doi}",
+                params=params,
+                headers=headers,
+            )
+
+            if response.status_code == 404:
+                return {
+                    "doi": doi,
+                    "exists": False,
+                    "resolved_title": None,
+                    "resolved_authors": [],
+                    "resolved_year": None,
+                    "resolved_venue": None,
+                    "success": True,
+                    "error": None,
+                }
+
+            if response.status_code == 429:
+                return {
+                    "doi": doi,
+                    "exists": None,
+                    "resolved_title": None,
+                    "resolved_authors": [],
+                    "resolved_year": None,
+                    "resolved_venue": None,
+                    "success": False,
+                    "error": "Crossref rate limit exceeded.",
+                }
+
+            response.raise_for_status()
+
+    except httpx.HTTPError as exc:
+        return {
+            "doi": doi,
+            "exists": None,
+            "resolved_title": None,
+            "resolved_authors": [],
+            "resolved_year": None,
+            "resolved_venue": None,
+            "success": False,
+            "error": str(exc) or f"{type(exc).__name__} with no message.",
+        }
+
+    try:
+        payload = response.json()
+
+    except ValueError as exc:
+        return {
+            "doi": doi,
+            "exists": None,
+            "resolved_title": None,
+            "resolved_authors": [],
+            "resolved_year": None,
+            "resolved_venue": None,
+            "success": False,
+            "error": f"Failed to parse Crossref response: {exc}",
+        }
+
+    item = payload.get("message") or {}
+
+    titles = item.get("title") or []
+    resolved_title = titles[0].strip() if titles else None
+
+    resolved_authors = []
+
+    for author in item.get("author", []):
+        given = (author.get("given") or "").strip()
+        family = (author.get("family") or "").strip()
+
+        full_name = " ".join(
+            part for part in [given, family] if part
+        )
+
+        if full_name:
+            resolved_authors.append(full_name)
+
+    date_data = (
+        item.get("published")
+        or item.get("published-print")
+        or item.get("published-online")
+    )
+
+    resolved_year, _ = parse_crossref_date(date_data)
+
+    container_titles = item.get("container-title") or []
+    resolved_venue = container_titles[0].strip() if container_titles else None
+
+    return {
+        "doi": doi,
+        "exists": True,
+        "resolved_title": resolved_title,
+        "resolved_authors": resolved_authors,
+        "resolved_year": resolved_year,
+        "resolved_venue": resolved_venue,
+        "success": True,
+        "error": None,
+    }
 
 
-def verify_paper_metadata(
+async def verify_paper_metadata(
     title: str,
     authors: list[str],
     year: int | None = None,
@@ -2453,17 +2953,245 @@ def verify_paper_metadata(
 ) -> dict:
     """
     Verify bibliographic metadata against live academic sources.
+
+    DOI-first: if a DOI is given, reuses verify_doi() to resolve it
+    directly - no need to duplicate that lookup logic here. Falls
+    back to a Crossref title search (reusing search_crossref()) when
+    no DOI was given, or the given DOI didn't resolve to a real
+    record (never assumes a failed/missing DOI means the paper itself
+    doesn't exist - it might just be findable under a title search
+    instead).
+
+    Like verify_doi(), this reports comparison FACTS
+    (title_match/author_overlap/year_match), not a single opinionated
+    "verified" boolean - deciding whether those facts add up to a
+    genuinely verified citation is the Citation Reviewer's own
+    judgment (CITATION_REVIEWER_PROMPT: "Minor formatting differences
+    should not automatically cause rejection... Focus on identity and
+    substantive metadata consistency"), consistent with this
+    project's tool/agent boundary elsewhere.
+
+    title_match uses the same normalized-equality comparison already
+    used for deduplication (normalize_title_for_dedup) - tolerant of
+    case/punctuation/whitespace differences, not a fuzzy match.
     """
-    pass
+
+    normalized_claimed_title = normalize_title_for_dedup(title)
+
+    matched_title = None
+    matched_authors: list[str] = []
+    matched_year = None
+    matched_doi = None
+    verification_source = "none"
+    found = False
+    tool_error = None
+
+    if doi:
+        doi_result = await verify_doi(doi)
+
+        if doi_result["success"] and doi_result["exists"]:
+            matched_title = doi_result["resolved_title"]
+            matched_authors = doi_result["resolved_authors"]
+            matched_year = doi_result["resolved_year"]
+            matched_doi = normalize_doi_for_dedup(doi)
+            verification_source = "doi"
+            found = True
+
+        elif not doi_result["success"]:
+            tool_error = doi_result["error"]
+
+    if not found:
+        search_result = await search_crossref(title, max_results=5)
+
+        if search_result["success"]:
+            # A successful (even if empty) search is a real outcome,
+            # not a failure - clears any earlier DOI-check error since
+            # that error no longer describes what actually happened.
+            tool_error = None
+
+            for paper in search_result["papers"]:
+                if (
+                    normalize_title_for_dedup(paper.get("title"))
+                    == normalized_claimed_title
+                ):
+                    matched_title = paper.get("title")
+                    matched_authors = paper.get("authors") or []
+                    matched_year = paper.get("publication_year")
+                    matched_doi = normalize_doi_for_dedup(paper.get("doi"))
+                    verification_source = "title_search"
+                    found = True
+                    break
+
+        elif tool_error is None:
+            tool_error = search_result["error"]
+
+    title_match = bool(
+        normalized_claimed_title
+        and matched_title
+        and normalize_title_for_dedup(matched_title) == normalized_claimed_title
+    )
+
+    normalized_claimed_authors = {
+        author.strip().lower() for author in (authors or []) if author and author.strip()
+    }
+    normalized_matched_authors = {
+        author.strip().lower() for author in matched_authors if author and author.strip()
+    }
+    author_overlap_count = len(normalized_claimed_authors & normalized_matched_authors)
+
+    if year is not None and matched_year is not None:
+        year_match = year == matched_year
+    else:
+        year_match = None
+
+    return {
+        "title": title,
+        "doi": doi,
+        "verification_source": verification_source,
+        "found": found,
+        "matched_title": matched_title,
+        "matched_authors": matched_authors,
+        "matched_year": matched_year,
+        "matched_doi": matched_doi,
+        "title_match": title_match,
+        "author_overlap_count": author_overlap_count,
+        "claimed_author_count": len(normalized_claimed_authors),
+        "matched_author_count": len(normalized_matched_authors),
+        "year_match": year_match,
+        "success": found or tool_error is None,
+        "error": tool_error,
+    }
 
 
-def verify_source_identity(
+async def verify_source_identity(
     paper_id: str,
     title: str,
     doi: str | None = None
 ) -> dict:
     """
-    Verify that a citation corresponds to the intended
-    scholarly source.
+    Confirm that a claimed title/doi pair genuinely identify the same
+    real scholarly work - the narrow "does this citation's identity
+    hold together" check CITATION_REVIEWER_PROMPT distinguishes from
+    general metadata verification (Section 4 vs Section 3): a DOI
+    that resolves fine but to a DIFFERENT paper than the claimed
+    title is exactly the failure mode this catches.
+
+    paper_id is carried through unchanged into the result purely for
+    the caller's own bookkeeping (correlating this identity check
+    back to its Claim -> Evidence -> Paper -> Citation chain) - this
+    function does not look paper_id up anywhere itself.
+
+    Reuses verify_paper_metadata()'s DOI-first / title-search-fallback
+    logic rather than duplicating it - author/year aren't relevant to
+    a pure identity check, so only its title-match result is used.
+
+    Tri-state identity_verified, same reasoning as verify_doi()'s
+    exists field:
+        True  -> a real record was found and its title matches the
+                 claimed title.
+        False -> a real record was found but its title does NOT
+                 match - a genuine identity mismatch (e.g. DOI points
+                 to a different paper).
+        None  -> no record could be found/checked at all - unverified,
+                 not a confirmed mismatch.
     """
-    pass
+
+    metadata_result = await verify_paper_metadata(
+        title=title,
+        authors=[],
+        year=None,
+        doi=doi,
+    )
+
+    if not metadata_result["found"]:
+        identity_verified = None
+        explanation = (
+            "No scholarly record could be found for this title/DOI - "
+            "identity could not be verified."
+            if metadata_result["success"]
+            else f"Identity check failed: {metadata_result['error']}"
+        )
+
+    elif metadata_result["title_match"]:
+        identity_verified = True
+        explanation = "The resolved record's title matches the claimed title."
+
+    else:
+        identity_verified = False
+        explanation = (
+            "A record was found, but its title does not match the claimed "
+            "title - possible source-identity mismatch "
+            f"(resolved: {metadata_result['matched_title']!r})."
+        )
+
+    return {
+        "paper_id": paper_id,
+        "title": title,
+        "doi": doi,
+        "identity_verified": identity_verified,
+        "resolved_title": metadata_result["matched_title"],
+        "resolved_doi": metadata_result["matched_doi"],
+        "verification_source": metadata_result["verification_source"],
+        "explanation": explanation,
+        "success": metadata_result["success"],
+        "error": metadata_result["error"],
+    }
+
+
+def build_citation_review_result(
+    status: str,
+    verifications: list[dict] | None = None,
+    invalid_citation_ids: list[str] | None = None,
+    unsupported_claim_ids: list[str] | None = None,
+    revision_instructions: list[str] | None = None,
+    summary: str | None = None,
+) -> dict:
+    """
+    Assemble and validate the Citation Reviewer's structured
+    CitationReviewResult.
+
+    Judging whether each citation is genuinely verified - combining
+    the factual outputs of verify_doi()/verify_paper_metadata()/
+    verify_source_identity() into paper_exists/doi_verified/
+    metadata_verified/source_verified/claim_supported judgments per
+    citation, and deciding PASS vs REVISE - is the Citation Reviewer's
+    own reasoning; this function does not do that judgment.
+
+    Unlike every other build_*() tool in this pipeline, this one does
+    NOT mint new IDs: each CitationVerification.citation_id must be
+    an EXISTING citation_id from the draft under review - citations
+    were already minted in build_literature_review_draft(), so
+    reassigning citation_id here would break the citation-to-draft
+    traceability this whole review exists to protect. Same reasoning
+    as claim_id being preserved (not reassigned) in
+    build_literature_review_draft().
+
+    Returns a structured validation failure (never a fabricated or
+    partially-coerced CitationReviewResult) if the supplied fields
+    don't satisfy the schema.
+    """
+
+    try:
+        result = CitationReviewResult.model_validate(
+            {
+                "status": status,
+                "verifications": verifications or [],
+                "invalid_citation_ids": invalid_citation_ids or [],
+                "unsupported_claim_ids": unsupported_claim_ids or [],
+                "revision_instructions": revision_instructions or [],
+                "summary": summary,
+            }
+        )
+
+    except Exception as exc:
+        return {
+            "citation_review_result": None,
+            "success": False,
+            "error": f"CitationReviewResult validation failed: {exc}",
+        }
+
+    return {
+        "citation_review_result": result.model_dump(mode="json"),
+        "success": True,
+        "error": None,
+    }

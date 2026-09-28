@@ -3,6 +3,8 @@ from dotenv import load_dotenv
 from config import SYNTHESIZER_MODEL
 from prompts import SYNTHESIZER_PROMPT
 
+from tools import build_synthesis
+
 load_dotenv()
 
 
@@ -18,4 +20,8 @@ synthesizer = Agent(
     ),
 
     instruction=SYNTHESIZER_PROMPT,
+
+    tools=[
+        build_synthesis,
+    ],
 )

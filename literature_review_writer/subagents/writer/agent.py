@@ -3,13 +3,15 @@ from dotenv import load_dotenv
 from config import WRITER_MODEL
 from prompts import WRITER_PROMPT
 
+from tools import build_literature_review_draft
+
 load_dotenv()
 
 
 writer = Agent(
     name="writer",
 
-    model=WRITER_MODEL  ,
+    model=WRITER_MODEL,
 
     description=(
         "Literature review writing specialist responsible for transforming "
@@ -19,5 +21,7 @@ writer = Agent(
 
     instruction=WRITER_PROMPT,
 
-    tools=[],
+    tools=[
+        build_literature_review_draft,
+    ],
 )

@@ -7,6 +7,7 @@ from tools import (
     verify_doi,
     verify_paper_metadata,
     verify_source_identity,
+    build_citation_review_result,
 )
 
 load_dotenv()
@@ -29,5 +30,6 @@ citation_reviewer = Agent(
         verify_doi,
         verify_paper_metadata,
         verify_source_identity,
+        build_citation_review_result,
     ],
 )

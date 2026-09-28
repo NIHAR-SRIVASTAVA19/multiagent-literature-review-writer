@@ -94,6 +94,36 @@ MARKER_TIMEOUT_SECONDS = int(
     )
 )
 
+# Max number of describe_image_with_vlm() calls allowed to run at
+# once (expand_image_segments_to_text()). Images are independent of
+# each other, so running them concurrently (instead of one at a time)
+# cuts most of a paper's vision-analysis wall time down toward a
+# single call's latency - capped so a paper with many images doesn't
+# hammer the NVIDIA NIM endpoint with an unbounded burst of requests.
+VLM_CONCURRENCY = int(
+    os.getenv(
+        "VLM_CONCURRENCY",
+        "4",
+    )
+)
+
+# Per-request timeout (seconds) for the VLM/reasoning litellm.acompletion()
+# calls in tools.py (describe_image_with_vlm, analyze_paper_with_vlm's
+# synthesis call). NVIDIA NIM's hosted endpoints have been observed to
+# intermittently stall on an individual request - not erroring, just
+# never responding - for both vision and reasoning models. Without an
+# explicit timeout, litellm never raises litellm.Timeout, so the
+# existing is_retryable_vlm_error() retry-once logic can never fire
+# and a single stuck request hangs indefinitely (confirmed by hand -
+# see progress_log.md). This bounds that wait so a stall fails fast
+# and gets one real retry instead.
+VLM_REQUEST_TIMEOUT_SECONDS = int(
+    os.getenv(
+        "VLM_REQUEST_TIMEOUT_SECONDS",
+        "60",
+    )
+)
+
 # ============================================================
 # DATABASE CONFIGURATION
 # ============================================================
@@ -147,7 +177,22 @@ def nvidia_model(model_name: str) -> LiteLlm:
 ROOT_MODEL = nvidia_model(
     os.getenv(
         "ROOT_MODEL",
-        "nvidia/nemotron-3.5-lightning-30b-a3b",
+        # Was nvidia/nemotron-3.5-lightning-30b-a3b - replaced project-
+        # wide (all 5 roles that used it) after that model's hosted NIM
+        # endpoint was confirmed hanging indefinitely - a reliability
+        # problem also seen on this model in another project.
+        # openai/gpt-oss-20b was the replacement, verified live and
+        # solid across dozens of calls all session (Root/Search/
+        # Analysis/Validator/Citation Reviewer) - but then it ALSO hung
+        # (confirmed via raw httpx, 30s ReadTimeout, while
+        # nemotron-3-ultra-550b-a55b responded fine at the same
+        # moment). Replaced again with nemotron-3-ultra-550b-a55b -
+        # already proven reliable for real tool-calling 3x this session
+        # (Synthesizer/Writer/Content Reviewer, all first-try
+        # successes) - consolidating all 5 roles onto one thoroughly
+        # verified model rather than chasing another single-purpose
+        # replacement. See progress_log.md for the full incident.
+        "nvidia/nemotron-3-ultra-550b-a55b",
     )
 )
 
@@ -155,7 +200,7 @@ ROOT_MODEL = nvidia_model(
 SEARCH_MODEL = nvidia_model(
     os.getenv(
         "SEARCH_MODEL",
-        "nvidia/nemotron-3.5-lightning-30b-a3b",
+        "nvidia/nemotron-3-ultra-550b-a55b",
     )
 )
 
@@ -164,12 +209,12 @@ ANALYSIS_MODEL_NAME = os.getenv(
     "ANALYSIS_MODEL",
     # Reasoning/orchestration only (tool calls, judgment) - matches
     # the same workhorse reasoning model used elsewhere (Root, Search
-    # Coordinator, Validator). Vision calls use VLM_MODEL_NAME below,
-    # not this - kimi-k3's hosted vision endpoint was measured at
-    # 7+ minutes for a single request (still not returned when
-    # aborted); llama-3.2-11b-vision-instruct returned an accurate
-    # answer in ~15s on the same infrastructure.
-    "nvidia/nemotron-3.5-lightning-30b-a3b",
+    # Coordinator, Validator, reviewers). Vision calls use
+    # VLM_MODEL_NAME below, not this - kimi-k3's hosted vision
+    # endpoint was measured at 7+ minutes for a single request (still
+    # not returned when aborted); llama-3.2-11b-vision-instruct
+    # returned an accurate answer in ~15s on the same infrastructure.
+    "nvidia/nemotron-3-ultra-550b-a55b",
 )
 
 ANALYSIS_MODEL = nvidia_model(ANALYSIS_MODEL_NAME)
@@ -195,7 +240,14 @@ SYNTHESIZER_MODEL = nvidia_model(
 WRITER_MODEL = nvidia_model(
     os.getenv(
         "WRITER_MODEL",
-        "deepseek-ai/deepseek-v4-pro-0813",
+        # Was deepseek-ai/deepseek-v4-pro-0813 - confirmed dead (NVIDIA
+        # NIM returns 410 Gone, reached end-of-life 2026-09-14, same
+        # class of issue as the ROOT/SEARCH/ANALYSIS/VALIDATOR/CITATION_REVIEWER
+        # model swap above). Replaced with the same model already used
+        # for SYNTHESIZER_MODEL/CONTENT_REVIEWER_MODEL below - verified
+        # live on this NIM account before switching (10.2s, good-quality
+        # response) rather than left on a dead model.
+        "nvidia/nemotron-3-ultra-550b-a55b",
     )
 )
 
@@ -203,7 +255,7 @@ WRITER_MODEL = nvidia_model(
 VALIDATOR_MODEL = nvidia_model(
     os.getenv(
         "VALIDATOR_MODEL",
-        "nvidia/nemotron-3.5-lightning-30b-a3b",
+        "nvidia/nemotron-3-ultra-550b-a55b",
     )
 )
 
@@ -219,7 +271,7 @@ CONTENT_REVIEWER_MODEL = nvidia_model(
 CITATION_REVIEWER_MODEL = nvidia_model(
     os.getenv(
         "CITATION_REVIEWER_MODEL",
-        "nvidia/nemotron-3.5-lightning-30b-a3b",
+        "nvidia/nemotron-3-ultra-550b-a55b",
     )
 )
 
